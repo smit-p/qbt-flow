@@ -1,0 +1,13 @@
+# Your live config — NEVER commit this
+config.env
+
+# Logs
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
