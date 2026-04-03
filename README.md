@@ -7,7 +7,7 @@ Dynamically throttles your qBittorrent download and upload speed limits based on
 1. Every N seconds (default: 15), the script polls `GET /status/sessions` on your Plex server.
 2. It sums the actual stream bitrates reported by Plex (not just the media bitrate — it uses the real transcoded/direct play bandwidth).
 3. It subtracts that usage (plus a headroom multiplier) from your total line speed.
-4. The remaining bandwidth is divided between download and upload and pushed to all configured qBittorrent instances via the Web API.
+4. The remaining bandwidth is divided between download and upload. If multiple qBittorrent instances are configured, the limit is split evenly between them (configurable), then pushed to each instance via the Web API.
 5. If no streams are active, all speed limits are cleared (set to unlimited).
 6. On shutdown (SIGTERM/SIGINT), limits are automatically removed so qBittorrent isn't left throttled.
 
@@ -117,9 +117,11 @@ journalctl -u plex-qbt-throttle -f
 Logs are written to `throttle.log` in the script directory (configurable via `LOG_FILE`). Logs are automatically rotated at 5 MB with 3 backups kept. Set `LOG_LEVEL=DEBUG` for verbose output. Sample output:
 
 ```
-2025-01-15 14:23:01 [INFO] 2 active stream(s) — Plex using 43.2 Mbps
-2025-01-15 14:23:01 [INFO] qbt limits set: DL=119.7 MB/s  UL=134.7 MB/s
-2025-01-15 14:23:16 [INFO] No active streams — removing qbt limits
+2026-01-15 14:23:01 INFO plex_qbt_throttle starting (poll=15s, DL=1000 Mbps, UL=1000 Mbps)
+2026-01-15 14:23:01 INFO [THROTTLE] http://localhost:39000: dl=47.4 MB/s ul=53.3 MB/s (2 stream(s), Plex using ~43 Mbps, remaining DL 946 Mbps / UL 946 Mbps)
+2026-01-15 14:23:01 INFO [THROTTLE] http://localhost:39001: dl=47.4 MB/s ul=53.3 MB/s (2 stream(s), Plex using ~43 Mbps, remaining DL 946 Mbps / UL 946 Mbps)
+2026-01-15 14:23:16 INFO [NORMAL] http://localhost:39000: dl=unlimited ul=unlimited
+2026-01-15 14:23:16 INFO [NORMAL] http://localhost:39001: dl=unlimited ul=unlimited
 ```
 
 ## Dry-run mode
