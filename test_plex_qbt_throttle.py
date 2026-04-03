@@ -8,6 +8,8 @@ import os
 import sys
 import threading
 import unittest
+from email.message import Message
+from typing import Optional
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 from urllib.error import URLError, HTTPError
@@ -27,7 +29,7 @@ import plex_qbt_throttle as m  # noqa: E402  (import after env setup)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_response(body: bytes, status: int = 200, headers: dict = None):
+def _make_response(body: bytes, status: int = 200, headers: Optional[dict] = None):
     """Return a mock that behaves as an open urllib response (context manager)."""
     resp = MagicMock()
     resp.read.return_value = body
@@ -300,7 +302,7 @@ class TestQbtClientLogin(unittest.TestCase):
         self.assertIsNone(c.cookie)
 
     def test_login_fails_on_httperror(self):
-        with patch("plex_qbt_throttle.urlopen", side_effect=HTTPError(None, 401, "Unauthorized", {}, None)):
+        with patch("plex_qbt_throttle.urlopen", side_effect=HTTPError("", 401, "Unauthorized", Message(), None)):
             c = self._make_client()
             ok = c.login()
         self.assertFalse(ok)
@@ -489,7 +491,7 @@ class TestGetPlexSessions(unittest.TestCase):
         self.assertEqual(bps, 0)
 
     def test_httperror_returns_minus_one(self):
-        with patch("plex_qbt_throttle.urlopen", side_effect=HTTPError(None, 401, "Unauthorized", {}, None)):
+        with patch("plex_qbt_throttle.urlopen", side_effect=HTTPError("", 401, "Unauthorized", Message(), None)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, -1)
         self.assertEqual(bps, 0)
