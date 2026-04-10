@@ -156,6 +156,7 @@ class TestApplyLimits(unittest.TestCase):
         m.last_dl_limit = None
         m.last_ul_limit = None
         m.last_racing_active = None
+        m.last_detail = None
         m.DRY_RUN = False
         m.QBT_SPLIT_BETWEEN_INSTANCES = True
         m.RACING_WINDOW_ENABLED = False
@@ -166,6 +167,7 @@ class TestApplyLimits(unittest.TestCase):
         m.last_dl_limit = None
         m.last_ul_limit = None
         m.last_racing_active = None
+        m.last_detail = None
         m.DRY_RUN = False
         m.RACING_WINDOW_ENABLED = False
 
@@ -188,9 +190,23 @@ class TestApplyLimits(unittest.TestCase):
         m.last_dl_limit = 50 * 1024 * 1024
         m.last_ul_limit = 25 * 1024 * 1024
         m.last_racing_active = False  # same state as current (racing disabled)
+        m.last_detail = "1 stream(s), using ~5 Mbps"
         with patch.object(m, 'clients', [client]):
-            m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE")
+            m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE",
+                           detail="1 stream(s), using ~5 Mbps")
         client.set_speed_limits.assert_not_called()
+
+    def test_reapplies_when_detail_changes(self):
+        """Stream count change should trigger re-apply even if byte limits are similar."""
+        client = self._make_client()
+        m.last_dl_limit = 50 * 1024 * 1024
+        m.last_ul_limit = 25 * 1024 * 1024
+        m.last_racing_active = False
+        m.last_detail = "1 stream(s), using ~5 Mbps"
+        with patch.object(m, 'clients', [client]):
+            m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE",
+                           detail="2 stream(s), using ~5 Mbps")
+        client.set_speed_limits.assert_called_once()
 
     def test_applies_when_limits_change_by_more_than_1_pct(self):
         client = self._make_client()
@@ -1098,6 +1114,38 @@ class TestJellyfinEmbySessions(unittest.TestCase):
             count, bps = m.get_jellyfin_sessions()
         self.assertEqual(count, 1)
         self.assertEqual(bps, 0)
+
+    def test_jellyfin_transcoding_info_bitrate_fallback(self):
+        """When NowPlayingItem has no Bitrate, use TranscodingInfo.Bitrate."""
+        data = json.dumps([
+            {
+                "NowPlayingItem": {"Name": "Some Movie"},
+                "PlayState": {"IsPaused": False},
+                "TranscodingInfo": {"Bitrate": 9_872_000},
+            }
+        ]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 1)
+        self.assertEqual(bps, 9_872_000)
+
+    def test_jellyfin_media_sources_bitrate_fallback(self):
+        """When NowPlayingItem and TranscodingInfo have no Bitrate, use MediaSources."""
+        data = json.dumps([
+            {
+                "NowPlayingItem": {
+                    "Name": "Some Movie",
+                    "MediaSources": [{"Bitrate": 15_000_000}],
+                },
+                "PlayState": {"IsPaused": False},
+            }
+        ]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 1)
+        self.assertEqual(bps, 15_000_000)
 
     def test_jellyfin_malformed_json_returns_minus_one(self):
         resp = _make_response(b"not json")

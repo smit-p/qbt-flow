@@ -203,6 +203,7 @@ log = logging.getLogger("qbt_flow")
 last_dl_limit = None
 last_ul_limit = None
 last_racing_active = None
+last_detail = None
 
 _start_time = 0.0
 _status = {
@@ -333,7 +334,16 @@ def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix=""):
             if play_state.get("IsPaused", False):
                 continue
             count += 1
-            total_bps += now_playing.get("Bitrate", 0)
+            # Bitrate may be on NowPlayingItem, TranscodingInfo, or MediaSources
+            bitrate = now_playing.get("Bitrate", 0)
+            if not bitrate:
+                bitrate = session.get("TranscodingInfo", {}).get("Bitrate", 0)
+            if not bitrate:
+                for ms in now_playing.get("MediaSources", []):
+                    bitrate = ms.get("Bitrate", 0)
+                    if bitrate:
+                        break
+            total_bps += bitrate
         return count, total_bps
     except (URLError, HTTPError, json.JSONDecodeError, ValueError, KeyError) as e:
         log.warning("Media server session check failed: %s", e)
@@ -476,16 +486,17 @@ def _is_racing_window():
 
 
 def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
-    global last_dl_limit, last_ul_limit, last_racing_active
+    global last_dl_limit, last_ul_limit, last_racing_active, last_detail
 
     racing_active = _is_racing_window()
 
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
-    # But always re-apply when racing state has changed.
+    # But always re-apply when label/detail changes (e.g. stream count).
     if not force and last_dl_limit is not None and last_ul_limit is not None:
         dl_diff = abs(dl_bytes - last_dl_limit) / max(last_dl_limit, 1)
         ul_diff = abs(ul_bytes - last_ul_limit) / max(last_ul_limit, 1)
-        if dl_diff < 0.01 and ul_diff < 0.01 and racing_active == last_racing_active:
+        detail_changed = detail != last_detail
+        if dl_diff < 0.01 and ul_diff < 0.01 and racing_active == last_racing_active and not detail_changed:
             log.debug("Limits unchanged within tolerance, skipping API call")
             return
 
@@ -539,6 +550,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
     last_dl_limit = dl_bytes
     last_ul_limit = ul_bytes
     last_racing_active = racing_active
+    last_detail = detail
 
 # ---------------------------------------------------------------------------
 # Limit calculation
