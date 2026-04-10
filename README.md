@@ -42,7 +42,7 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `JELLYFIN_TOKEN` | *(none)* | Jellyfin API key (Dashboard → API Keys → +) |
 | `EMBY_URL` | *(none)* | Emby URL. Set with `EMBY_TOKEN` to enable Emby polling |
 | `EMBY_TOKEN` | *(none)* | Emby API key (Dashboard → API Keys → +) |
-| `QBT_INSTANCES` | `localhost:8080:admin:adminadmin` | Comma-separated list of qBittorrent instances: `host:port:user:pass[:scheme]` |
+| `QBT_INSTANCES` | *(none — required)* | Comma-separated list of qBittorrent instances: `host:port:user:pass[:scheme]` |
 | `TOTAL_BANDWIDTH_BPS` | `1000000000` | Your download line speed in bits/sec (1 Gbps default) |
 | `TOTAL_UPLOAD_BPS` | *(same as download)* | Your upload line speed in bits/sec — set for asymmetric connections |
 | `QBT_HEADROOM_FRACTION` | `0.8` | Fraction of remaining bandwidth to give qbt (download) |
@@ -165,14 +165,13 @@ Create `/etc/systemd/system/qbt-flow.service`:
 ```ini
 [Unit]
 Description=qbt-flow — dynamic qBittorrent bandwidth manager
-After=network.target plexmediaserver.service qbittorrent-nox@39000.service qbittorrent-nox@39001.service
-Wants=plexmediaserver.service
+After=network.target
 
 [Service]
 Type=simple
-User=smit
-WorkingDirectory=/home/smit/qbt-flow
-ExecStart=/usr/bin/python3 /home/smit/qbt-flow/qbt_flow.py
+User=YOUR_USER
+WorkingDirectory=/path/to/qbt-flow
+ExecStart=/usr/bin/python3 /path/to/qbt-flow/qbt_flow.py
 Restart=on-failure
 RestartSec=30
 StandardOutput=null

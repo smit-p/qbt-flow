@@ -103,7 +103,7 @@ if not PLEX_URL and not JELLYFIN_URL and not EMBY_URL:
 # qBittorrent instances as "host:port:user:pass[:scheme]" comma-separated pairs
 # e.g. QBT_INSTANCES=localhost:8080:admin:password,localhost:8443:admin:password:https
 def _parse_qbt_instances():
-    raw = _env("QBT_INSTANCES", "localhost:8080:admin:adminadmin")
+    raw = _env("QBT_INSTANCES", "")
     instances = []
     for entry in raw.split(","):
         entry = entry.strip()
