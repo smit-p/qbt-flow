@@ -30,7 +30,14 @@ Optionally supports multiple qBittorrent instances and a racing window where one
 curl -fsSL https://raw.githubusercontent.com/smit-p/qbt-flow/main/setup.sh | bash
 ```
 
-This clones the repo, creates `config.env`, and tells you what to edit. Once configured, re-run the same command (or `./install.sh`) to install the systemd service.
+The interactive wizard walks you through:
+
+1. **Media servers** — select Plex / Jellyfin / Emby and enter URLs + tokens
+2. **qBittorrent instances** — add one or more with host, port, and credentials
+3. **Bandwidth** — enter your download/upload speeds (e.g. `1Gbps`, `50Mbps`)
+4. **Advanced options** — optionally configure the racing window
+
+It writes `config.env`, then offers to install a systemd service so qbt-flow starts on boot.
 
 To install to a custom directory:
 
@@ -38,13 +45,13 @@ To install to a custom directory:
 QBT_FLOW_DIR=/opt/qbt-flow curl -fsSL https://raw.githubusercontent.com/smit-p/qbt-flow/main/setup.sh | bash
 ```
 
-To run manually without systemd:
+To set up manually without the wizard:
 
 ```bash
 git clone https://github.com/smit-p/qbt-flow.git && cd qbt-flow
 cp config.env.example config.env
 $EDITOR config.env   # fill in your media server URLs/tokens, QBT_INSTANCES, etc.
-python3 qbt_flow.py
+./install.sh          # install systemd service (or run: python3 qbt_flow.py)
 ```
 
 ## Configuration
