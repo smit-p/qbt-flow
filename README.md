@@ -1,6 +1,10 @@
 # qbt-flow
 
-Dynamic bandwidth manager for qBittorrent. Adjusts download and upload speed limits in real time based on active media-server streams (Plex, Jellyfin, or Emby) and configurable racing windows. When a stream is playing, qBittorrent is throttled to prevent buffering. When idle, limits are gradually removed and qBittorrent runs at full speed. During racing hours, one instance gets priority while others are hard-capped.
+Automatic bandwidth manager for qBittorrent that prevents media-server buffering without sacrificing download speed.
+
+qbt-flow watches your Plex, Jellyfin, or Emby server for active streams and dynamically adjusts qBittorrent's speed limits based on real-time bandwidth usage. When someone starts watching, qBittorrent is throttled just enough to guarantee smooth playback. When playback stops, limits ramp back up gradually and qBittorrent returns to full speed — no manual intervention needed.
+
+Optionally supports multiple qBittorrent instances and a racing window where one instance gets priority bandwidth during configurable hours.
 
 ## How it works
 
@@ -17,8 +21,8 @@ Dynamic bandwidth manager for qBittorrent. Adjusts download and upload speed lim
 ## Requirements
 
 - Python 3.8+ (no third-party packages — stdlib only)
+- qBittorrent 4.1+ with Web UI enabled
 - Plex, Jellyfin, or Emby media server (accessible via HTTP)
-- qBittorrent with Web UI enabled
 
 ## Install
 
