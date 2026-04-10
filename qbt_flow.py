@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-plex_qbt_throttle.py
-Dynamically throttles qBittorrent speed limits based on active Plex streams.
-Sums actual stream bitrates from Plex session data, then allocates a
-configurable fraction of remaining bandwidth to qBittorrent.
+qbt_flow.py
+Dynamic bandwidth manager for qBittorrent instances.
+Throttles download/upload limits based on active Plex streams and prioritises
+a racing instance during a configurable time window.
 
 Configuration is loaded from a config.env file in the same directory, or
 from environment variables. Copy config.env.example to config.env to get started.
@@ -18,6 +18,7 @@ import logging.handlers
 import sys
 import signal
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
@@ -119,6 +120,20 @@ REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 10)
 # Behavior when Plex is unreachable: "unlimited" (remove limits), "keep" (keep last limits)
 PLEX_UNREACHABLE_ACTION = _env("PLEX_UNREACHABLE_ACTION", "keep")
 
+# ---------------------------------------------------------------------------
+# Racing window — during this time window the racing instance gets priority
+# and the non-racing (media) instance is hard-capped.
+# ---------------------------------------------------------------------------
+RACING_WINDOW_ENABLED = _env("RACING_WINDOW_ENABLED", "false").lower() in ("true", "1", "yes")
+RACING_WINDOW_START   = _env_int("RACING_WINDOW_START", 0)    # hour (0-23), e.g. 0 = midnight
+RACING_WINDOW_END     = _env_int("RACING_WINDOW_END",   7)    # hour (0-23), e.g. 7 = 7 AM
+RACING_INSTANCE_PORT  = _env_int("RACING_INSTANCE_PORT", 39001)
+
+# Hard caps for the NON-racing instance during the racing window (bytes/sec).
+# These override the normal calculated limits for that instance only.
+RACING_NON_RACING_DL_LIMIT = _env_int("RACING_NON_RACING_DL_LIMIT", 5 * 1024 * 1024)   # 5 MB/s
+RACING_NON_RACING_UL_LIMIT = _env_int("RACING_NON_RACING_UL_LIMIT", 5 * 1024 * 1024)   # 5 MB/s
+
 LOG_FILE  = _env("LOG_FILE", str(_SCRIPT_DIR / "throttle.log"))
 LOG_LEVEL = getattr(logging, _env("LOG_LEVEL", "INFO").upper(), logging.INFO)
 
@@ -136,7 +151,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger("plex_qbt_throttle")
+log = logging.getLogger("qbt_flow")
 
 # ---------------------------------------------------------------------------
 # State
@@ -266,40 +281,76 @@ class QbtClient:
 clients = [QbtClient(h, p, u, pw, s) for h, p, u, pw, s in QBT_INSTANCES]
 
 
+def _is_racing_window():
+    """Return True if the current local time falls within the racing window."""
+    if not RACING_WINDOW_ENABLED:
+        return False
+    hour = datetime.now().hour
+    if RACING_WINDOW_START <= RACING_WINDOW_END:
+        return RACING_WINDOW_START <= hour < RACING_WINDOW_END
+    else:
+        # Wraps midnight, e.g. start=22, end=7
+        return hour >= RACING_WINDOW_START or hour < RACING_WINDOW_END
+
+
 def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
     global last_dl_limit, last_ul_limit
 
+    racing_active = _is_racing_window()
+
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
+    # But always re-apply when racing state might have changed.
     if not force and last_dl_limit is not None and last_ul_limit is not None:
         dl_diff = abs(dl_bytes - last_dl_limit) / max(last_dl_limit, 1)
         ul_diff = abs(ul_bytes - last_ul_limit) / max(last_ul_limit, 1)
-        if dl_diff < 0.01 and ul_diff < 0.01:
+        if dl_diff < 0.01 and ul_diff < 0.01 and not racing_active:
             log.debug("Limits unchanged within tolerance, skipping API call")
             return
 
-    # Optionally split limits across instances
+    # Compute per-instance limits
     num_instances = len(clients)
-    if QBT_SPLIT_BETWEEN_INSTANCES and num_instances > 1 and dl_bytes > 0:
-        per_dl = max(dl_bytes // num_instances, MIN_QBT_DL_BYTES)
-        per_ul = max(ul_bytes // num_instances, MIN_QBT_UL_BYTES)
-    else:
-        per_dl, per_ul = dl_bytes, ul_bytes
 
     for client in clients:
+        client_port = int(client.base.rsplit(":", 1)[-1])
+
+        if racing_active and num_instances > 1:
+            # During racing window: cap the media instance, give the rest to racing
+            if client_port == RACING_INSTANCE_PORT:
+                # Racing instance gets total minus the non-racing cap
+                if dl_bytes == 0:
+                    c_dl, c_ul = 0, 0  # unlimited
+                else:
+                    c_dl = max(dl_bytes - RACING_NON_RACING_DL_LIMIT, MIN_QBT_DL_BYTES)
+                    c_ul = max(ul_bytes - RACING_NON_RACING_UL_LIMIT, MIN_QBT_UL_BYTES)
+            else:
+                # Non-racing (media) instance gets hard cap
+                c_dl = RACING_NON_RACING_DL_LIMIT
+                c_ul = RACING_NON_RACING_UL_LIMIT
+        elif QBT_SPLIT_BETWEEN_INSTANCES and num_instances > 1 and dl_bytes > 0:
+            c_dl = max(dl_bytes // num_instances, MIN_QBT_DL_BYTES)
+            c_ul = max(ul_bytes // num_instances, MIN_QBT_UL_BYTES)
+        else:
+            c_dl, c_ul = dl_bytes, ul_bytes
+
+        extra = ""
+        if racing_active and num_instances > 1:
+            is_racer = client_port == RACING_INSTANCE_PORT
+            extra = " [RACING]" if is_racer else " [CAPPED]"
+
         if DRY_RUN:
-            dl_str = f"{per_dl / (1024 * 1024):.1f} MB/s" if per_dl else "unlimited"
-            ul_str = f"{per_ul / (1024 * 1024):.1f} MB/s" if per_ul else "unlimited"
-            log.info("[DRY-RUN] [%s] %s: dl=%s ul=%s%s", label, client.base, dl_str, ul_str,
+            dl_str = f"{c_dl / (1024 * 1024):.1f} MB/s" if c_dl else "unlimited"
+            ul_str = f"{c_ul / (1024 * 1024):.1f} MB/s" if c_ul else "unlimited"
+            log.info("[DRY-RUN] [%s] %s%s: dl=%s ul=%s%s", label, client.base, extra, dl_str, ul_str,
                      f" ({detail})" if detail else "")
             continue
         if not client.ensure_logged_in():
             log.error("Cannot login to qbt at %s — skipping", client.base)
             continue
-        ok = client.set_speed_limits(per_dl, per_ul)
+        ok = client.set_speed_limits(c_dl, c_ul)
         if ok:
-            dl_str = f"{per_dl / (1024 * 1024):.1f} MB/s" if per_dl else "unlimited"
-            ul_str = f"{per_ul / (1024 * 1024):.1f} MB/s" if per_ul else "unlimited"
-            log.info("[%s] %s: dl=%s ul=%s%s", label, client.base, dl_str, ul_str,
+            dl_str = f"{c_dl / (1024 * 1024):.1f} MB/s" if c_dl else "unlimited"
+            ul_str = f"{c_ul / (1024 * 1024):.1f} MB/s" if c_ul else "unlimited"
+            log.info("[%s] %s%s: dl=%s ul=%s%s", label, client.base, extra, dl_str, ul_str,
                      f" ({detail})" if detail else "")
         else:
             client.cookie = None
@@ -364,10 +415,16 @@ def main():
 
     _validate_config()
 
-    log.info("plex_qbt_throttle starting (poll=%ds, DL=%.0f Mbps, UL=%.0f Mbps%s)",
+    log.info("qbt_flow starting (poll=%ds, DL=%.0f Mbps, UL=%.0f Mbps%s)",
              POLL_INTERVAL, TOTAL_BANDWIDTH_BPS / 1_000_000,
              TOTAL_UPLOAD_BPS / 1_000_000,
              ", dry-run" if DRY_RUN else "")
+    if RACING_WINDOW_ENABLED:
+        log.info("Racing window enabled: %02d:00–%02d:00, racing port=%d, "
+                 "media cap DL=%.1f MB/s UL=%.1f MB/s",
+                 RACING_WINDOW_START, RACING_WINDOW_END, RACING_INSTANCE_PORT,
+                 RACING_NON_RACING_DL_LIMIT / (1024 * 1024),
+                 RACING_NON_RACING_UL_LIMIT / (1024 * 1024))
 
     try:
         while not stop_event.is_set():
@@ -392,7 +449,7 @@ def main():
         if not DRY_RUN:
             log.info("Cleaning up — removing qbt speed limits")
             apply_limits(0, 0, "SHUTDOWN", force=True)
-        log.info("plex_qbt_throttle stopped")
+        log.info("qbt_flow stopped")
 
 if __name__ == "__main__":
     main()

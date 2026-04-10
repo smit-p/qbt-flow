@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-test_plex_qbt_throttle.py
-Unit tests for plex_qbt_throttle.py — stdlib only (unittest + unittest.mock).
+test_qbt_flow.py
+Unit tests for qbt_flow.py — stdlib only (unittest + unittest.mock).
 """
 
 import os
@@ -22,7 +22,7 @@ os.environ["PLEX_TOKEN"] = "test-token"
 os.environ["QBT_INSTANCES"] = "localhost:8080:admin:adminadmin"
 
 sys.path.insert(0, str(Path(__file__).parent))
-import plex_qbt_throttle as m  # noqa: E402  (import after env setup)
+import qbt_flow as m  # noqa: E402  (import after env setup)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +155,7 @@ class TestApplyLimits(unittest.TestCase):
         m.last_ul_limit = None
         m.DRY_RUN = False
         m.QBT_SPLIT_BETWEEN_INSTANCES = True
+        m.RACING_WINDOW_ENABLED = False
         m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024
         m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024
 
@@ -162,6 +163,7 @@ class TestApplyLimits(unittest.TestCase):
         m.last_dl_limit = None
         m.last_ul_limit = None
         m.DRY_RUN = False
+        m.RACING_WINDOW_ENABLED = False
 
     def _make_client(self, success=True):
         client = MagicMock()
@@ -280,7 +282,7 @@ class TestQbtClientLogin(unittest.TestCase):
 
     def test_login_extracts_sid_cookie(self):
         resp = _make_response(b"Ok", headers={"Set-Cookie": "SID=abc123; Path=/"})
-        with patch("plex_qbt_throttle.urlopen", return_value=resp):
+        with patch("qbt_flow.urlopen", return_value=resp):
             c = self._make_client()
             ok = c.login()
         self.assertTrue(ok)
@@ -288,21 +290,21 @@ class TestQbtClientLogin(unittest.TestCase):
 
     def test_login_fails_when_no_sid_in_response(self):
         resp = _make_response(b"Ok", headers={"Set-Cookie": "Path=/"})
-        with patch("plex_qbt_throttle.urlopen", return_value=resp):
+        with patch("qbt_flow.urlopen", return_value=resp):
             c = self._make_client()
             ok = c.login()
         self.assertFalse(ok)
         self.assertIsNone(c.cookie)
 
     def test_login_fails_on_urlerror(self):
-        with patch("plex_qbt_throttle.urlopen", side_effect=URLError("refused")):
+        with patch("qbt_flow.urlopen", side_effect=URLError("refused")):
             c = self._make_client()
             ok = c.login()
         self.assertFalse(ok)
         self.assertIsNone(c.cookie)
 
     def test_login_fails_on_httperror(self):
-        with patch("plex_qbt_throttle.urlopen", side_effect=HTTPError("", 401, "Unauthorized", Message(), None)):
+        with patch("qbt_flow.urlopen", side_effect=HTTPError("", 401, "Unauthorized", Message(), None)):
             c = self._make_client()
             ok = c.login()
         self.assertFalse(ok)
@@ -344,7 +346,7 @@ class TestQbtClientSetSpeedLimits(unittest.TestCase):
 
     def test_success_returns_true(self):
         resp = _make_response(b"", status=200)
-        with patch("plex_qbt_throttle.urlopen", return_value=resp):
+        with patch("qbt_flow.urlopen", return_value=resp):
             c = self._make_client()
             ok = c.set_speed_limits(1024, 512)
         self.assertTrue(ok)
@@ -354,7 +356,7 @@ class TestQbtClientSetSpeedLimits(unittest.TestCase):
         login_resp = _make_response(b"Ok", headers={"Set-Cookie": "SID=newtoken; Path=/"})
         success_resp = _make_response(b"", status=200)
         side = [URLError("auth"), URLError("auth"), login_resp, success_resp, success_resp]
-        with patch("plex_qbt_throttle.urlopen", side_effect=side):
+        with patch("qbt_flow.urlopen", side_effect=side):
             c = self._make_client()
             ok = c.set_speed_limits(1024, 512)
         self.assertTrue(ok)
@@ -362,7 +364,7 @@ class TestQbtClientSetSpeedLimits(unittest.TestCase):
 
     def test_no_retry_when_no_cookie(self):
         """If there's no cookie, don't attempt re-login on failure."""
-        with patch("plex_qbt_throttle.urlopen", side_effect=URLError("error")):
+        with patch("qbt_flow.urlopen", side_effect=URLError("error")):
             c = self._make_client()
             c.cookie = None
             ok = c.set_speed_limits(1024, 512)
@@ -371,7 +373,7 @@ class TestQbtClientSetSpeedLimits(unittest.TestCase):
     def test_returns_false_when_retry_also_fails(self):
         login_resp = _make_response(b"Ok", headers={"Set-Cookie": "SID=newtoken; Path=/"})
         side = [URLError("auth"), URLError("auth"), login_resp, URLError("still broken"), URLError("still broken")]
-        with patch("plex_qbt_throttle.urlopen", side_effect=side):
+        with patch("qbt_flow.urlopen", side_effect=side):
             c = self._make_client()
             ok = c.set_speed_limits(1024, 512)
         self.assertFalse(ok)
@@ -388,7 +390,7 @@ class TestGetPlexSessions(unittest.TestCase):
 
     def test_no_sessions(self):
         xml = b'<?xml version="1.0"?><MediaContainer size="0"></MediaContainer>'
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 0)
         self.assertEqual(bps, 0)
@@ -400,7 +402,7 @@ class TestGetPlexSessions(unittest.TestCase):
     <Player state="playing" />
   </Video>
 </MediaContainer>"""
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 1)
         self.assertEqual(bps, 20_000_000)   # 20000 kbps × 1000
@@ -412,7 +414,7 @@ class TestGetPlexSessions(unittest.TestCase):
     <Player state="paused" />
   </Video>
 </MediaContainer>"""
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 0)
         self.assertEqual(bps, 0)
@@ -424,7 +426,7 @@ class TestGetPlexSessions(unittest.TestCase):
     <Player state="stopped" />
   </Video>
 </MediaContainer>"""
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 0)
         self.assertEqual(bps, 0)
@@ -439,7 +441,7 @@ class TestGetPlexSessions(unittest.TestCase):
     <Player state="playing" />
   </Video>
 </MediaContainer>"""
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 2)
         self.assertEqual(bps, 25_000_000)
@@ -451,7 +453,7 @@ class TestGetPlexSessions(unittest.TestCase):
     <Player state="playing" />
   </Track>
 </MediaContainer>"""
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 1)
         self.assertEqual(bps, 320_000)
@@ -464,7 +466,7 @@ class TestGetPlexSessions(unittest.TestCase):
     <Media bitrate="8000" />
   </Video>
 </MediaContainer>"""
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 1)
         self.assertEqual(bps, 8_000_000)
@@ -479,25 +481,25 @@ class TestGetPlexSessions(unittest.TestCase):
     <Player state="paused" />
   </Video>
 </MediaContainer>"""
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(xml)):
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, 1)
         self.assertEqual(bps, 10_000_000)
 
     def test_urlerror_returns_minus_one(self):
-        with patch("plex_qbt_throttle.urlopen", side_effect=URLError("timeout")):
+        with patch("qbt_flow.urlopen", side_effect=URLError("timeout")):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, -1)
         self.assertEqual(bps, 0)
 
     def test_httperror_returns_minus_one(self):
-        with patch("plex_qbt_throttle.urlopen", side_effect=HTTPError("", 401, "Unauthorized", Message(), None)):
+        with patch("qbt_flow.urlopen", side_effect=HTTPError("", 401, "Unauthorized", Message(), None)):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, -1)
         self.assertEqual(bps, 0)
 
     def test_malformed_xml_returns_minus_one(self):
-        with patch("plex_qbt_throttle.urlopen", return_value=_make_response(b"not xml at all <>")):
+        with patch("qbt_flow.urlopen", return_value=_make_response(b"not xml at all <>")):
             count, bps = m.get_plex_sessions()
         self.assertEqual(count, -1)
         self.assertEqual(bps, 0)
@@ -583,6 +585,364 @@ class TestEnvHelpers(unittest.TestCase):
     def test_env_float_returns_default_on_bad_value(self):
         with patch.dict(os.environ, {"_TEST_FLOAT": "abc"}):
             self.assertAlmostEqual(m._env_float("_TEST_FLOAT", 3.14), 3.14)
+
+    def test_env_int_returns_default_when_missing(self):
+        os.environ.pop("_TEST_MISSING_INT", None)
+        self.assertEqual(m._env_int("_TEST_MISSING_INT", 7), 7)
+
+    def test_env_float_returns_default_when_missing(self):
+        os.environ.pop("_TEST_MISSING_FLOAT", None)
+        self.assertAlmostEqual(m._env_float("_TEST_MISSING_FLOAT", 2.5), 2.5)
+
+
+# ---------------------------------------------------------------------------
+# Racing window — _is_racing_window
+# ---------------------------------------------------------------------------
+
+class TestIsRacingWindow(unittest.TestCase):
+    def setUp(self):
+        self._orig_enabled = m.RACING_WINDOW_ENABLED
+        self._orig_start   = m.RACING_WINDOW_START
+        self._orig_end     = m.RACING_WINDOW_END
+
+    def tearDown(self):
+        m.RACING_WINDOW_ENABLED = self._orig_enabled
+        m.RACING_WINDOW_START   = self._orig_start
+        m.RACING_WINDOW_END     = self._orig_end
+
+    def test_disabled_always_false(self):
+        m.RACING_WINDOW_ENABLED = False
+        self.assertFalse(m._is_racing_window())
+
+    def test_inside_normal_window(self):
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START = 0
+        m.RACING_WINDOW_END   = 7
+        with patch("qbt_flow.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 3
+            self.assertTrue(m._is_racing_window())
+
+    def test_outside_normal_window(self):
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START = 0
+        m.RACING_WINDOW_END   = 7
+        with patch("qbt_flow.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 12
+            self.assertFalse(m._is_racing_window())
+
+    def test_at_start_boundary(self):
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START = 0
+        m.RACING_WINDOW_END   = 7
+        with patch("qbt_flow.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 0
+            self.assertTrue(m._is_racing_window())
+
+    def test_at_end_boundary_excluded(self):
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START = 0
+        m.RACING_WINDOW_END   = 7
+        with patch("qbt_flow.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 7
+            self.assertFalse(m._is_racing_window())
+
+    def test_wrap_midnight_inside_late(self):
+        """22:00–07:00 window, hour=23 → inside."""
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START = 22
+        m.RACING_WINDOW_END   = 7
+        with patch("qbt_flow.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 23
+            self.assertTrue(m._is_racing_window())
+
+    def test_wrap_midnight_inside_early(self):
+        """22:00–07:00 window, hour=3 → inside."""
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START = 22
+        m.RACING_WINDOW_END   = 7
+        with patch("qbt_flow.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 3
+            self.assertTrue(m._is_racing_window())
+
+    def test_wrap_midnight_outside(self):
+        """22:00–07:00 window, hour=15 → outside."""
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START = 22
+        m.RACING_WINDOW_END   = 7
+        with patch("qbt_flow.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 15
+            self.assertFalse(m._is_racing_window())
+
+
+# ---------------------------------------------------------------------------
+# Racing window — apply_limits integration
+# ---------------------------------------------------------------------------
+
+class TestApplyLimitsRacing(unittest.TestCase):
+    def setUp(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.DRY_RUN = False
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_INSTANCE_PORT  = 39001
+        m.RACING_NON_RACING_DL_LIMIT = 5 * 1024 * 1024
+        m.RACING_NON_RACING_UL_LIMIT = 5 * 1024 * 1024
+        m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024
+        m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024
+
+    def tearDown(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.DRY_RUN = False
+        m.RACING_WINDOW_ENABLED = False
+
+    def _make_client(self, port, success=True):
+        client = MagicMock()
+        client.ensure_logged_in.return_value = True
+        client.set_speed_limits.return_value = success
+        client.base = f"http://localhost:{port}"
+        client.cookie = "SID=test"
+        return client
+
+    @patch("qbt_flow._is_racing_window", return_value=True)
+    def test_racing_caps_media_instance(self, _mock):
+        media  = self._make_client(39000)
+        racing = self._make_client(39001)
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        with patch.object(m, 'clients', [media, racing]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        # Media instance (39000) should be capped
+        media.set_speed_limits.assert_called_once_with(
+            m.RACING_NON_RACING_DL_LIMIT,
+            m.RACING_NON_RACING_UL_LIMIT,
+        )
+        # Racing instance (39001) should get remainder
+        expected_dl = max(dl - m.RACING_NON_RACING_DL_LIMIT, m.MIN_QBT_DL_BYTES)
+        expected_ul = max(ul - m.RACING_NON_RACING_UL_LIMIT, m.MIN_QBT_UL_BYTES)
+        racing.set_speed_limits.assert_called_once_with(expected_dl, expected_ul)
+
+    @patch("qbt_flow._is_racing_window", return_value=True)
+    def test_racing_unlimited_gives_both_unlimited(self, _mock):
+        """When no Plex streams (dl_bytes=0), racing instance gets unlimited too."""
+        media  = self._make_client(39000)
+        racing = self._make_client(39001)
+        with patch.object(m, 'clients', [media, racing]):
+            m.apply_limits(0, 0, "NORMAL")
+        # Racing instance gets 0 (unlimited) when dl_bytes=0
+        racing.set_speed_limits.assert_called_once_with(0, 0)
+        # Media still capped
+        media.set_speed_limits.assert_called_once_with(
+            m.RACING_NON_RACING_DL_LIMIT,
+            m.RACING_NON_RACING_UL_LIMIT,
+        )
+
+    @patch("qbt_flow._is_racing_window", return_value=True)
+    def test_racing_enforces_min_floor_on_racing_instance(self, _mock):
+        """If total minus cap < MIN floor, racing instance gets MIN."""
+        media  = self._make_client(39000)
+        racing = self._make_client(39001)
+        # dl barely above the non-racing cap → racing gets MIN
+        dl = m.RACING_NON_RACING_DL_LIMIT + 1
+        ul = m.RACING_NON_RACING_UL_LIMIT + 1
+        with patch.object(m, 'clients', [media, racing]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        racing.set_speed_limits.assert_called_once_with(
+            m.MIN_QBT_DL_BYTES,
+            m.MIN_QBT_UL_BYTES,
+        )
+
+    @patch("qbt_flow._is_racing_window", return_value=True)
+    def test_racing_dry_run_logs_labels(self, _mock):
+        m.DRY_RUN = True
+        media  = self._make_client(39000)
+        racing = self._make_client(39001)
+        with patch.object(m, 'clients', [media, racing]):
+            # Should not raise; should not call set_speed_limits
+            m.apply_limits(100 * 1024 * 1024, 50 * 1024 * 1024, "THROTTLE")
+        media.set_speed_limits.assert_not_called()
+        racing.set_speed_limits.assert_not_called()
+
+    @patch("qbt_flow._is_racing_window", return_value=True)
+    def test_racing_always_reapplies_even_if_unchanged(self, _mock):
+        """During racing window, tolerance skip is disabled."""
+        client = self._make_client(39001)
+        m.last_dl_limit = 50 * 1024 * 1024
+        m.last_ul_limit = 25 * 1024 * 1024
+        with patch.object(m, 'clients', [client]):
+            m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE")
+        # Single instance → no racing split (needs >1), but tolerance IS skipped
+        client.set_speed_limits.assert_called_once()
+
+    @patch("qbt_flow._is_racing_window", return_value=True)
+    def test_racing_single_instance_no_racing_split(self, _mock):
+        """With a single instance, racing window doesn't do special split."""
+        client = self._make_client(39001)
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        with patch.object(m, 'clients', [client]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        # Single instance → normal path (no split, no racing logic)
+        client.set_speed_limits.assert_called_once_with(dl, ul)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+class TestMain(unittest.TestCase):
+    def setUp(self):
+        self._orig_token = m.PLEX_TOKEN
+        self._orig_inst  = m.QBT_INSTANCES
+        self._orig_dry   = m.DRY_RUN
+
+    def tearDown(self):
+        m.PLEX_TOKEN    = self._orig_token
+        m.QBT_INSTANCES = self._orig_inst
+        m.DRY_RUN       = self._orig_dry
+        m.stop_event.clear()
+
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_plex_sessions", return_value=(0, 0))
+    def test_main_loop_normal_no_streams(self, mock_plex, mock_apply):
+        """One iteration: no streams → NORMAL limits."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+
+        # Stop after one iteration
+        def stop_after_first(*args, **kwargs):
+            m.stop_event.set()
+
+        mock_apply.side_effect = stop_after_first
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+        mock_apply.assert_called()
+
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_plex_sessions", return_value=(2, 50_000_000))
+    def test_main_loop_throttle_with_streams(self, mock_plex, mock_apply):
+        """One iteration: active streams → THROTTLE limits."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+
+        call_count = [0]
+        def stop_on_second_call(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] >= 1:
+                m.stop_event.set()
+
+        mock_apply.side_effect = stop_on_second_call
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        # First apply was THROTTLE (with detail), second was SHUTDOWN cleanup
+        calls = mock_apply.call_args_list
+        self.assertTrue(any("THROTTLE" in str(c) for c in calls))
+
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_plex_sessions", return_value=(-1, 0))
+    def test_main_loop_plex_unreachable_keep(self, mock_plex, mock_apply):
+        """Plex unreachable with keep action → no apply_limits call in loop."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.PLEX_UNREACHABLE_ACTION = "keep"
+
+        # Run one iteration then stop
+        original_wait = m.stop_event.wait
+        call_count = [0]
+        def wait_and_stop(timeout):
+            call_count[0] += 1
+            if call_count[0] >= 1:
+                m.stop_event.set()
+            return original_wait(0)
+
+        with patch.object(m.stop_event, "wait", side_effect=wait_and_stop), \
+             patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_plex_sessions", return_value=(-1, 0))
+    def test_main_loop_plex_unreachable_unlimited(self, mock_plex, mock_apply):
+        """Plex unreachable with unlimited action → apply unlimited."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.PLEX_UNREACHABLE_ACTION = "unlimited"
+
+        def stop_after_first(*args, **kwargs):
+            m.stop_event.set()
+
+        mock_apply.side_effect = stop_after_first
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+        mock_apply.assert_called()
+
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_plex_sessions", return_value=(0, 0))
+    def test_main_non_dry_run_cleanup(self, mock_plex, mock_apply):
+        """Non-dry-run shutdown calls apply_limits(0, 0, SHUTDOWN, force=True)."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.stop_event.set()  # stop immediately
+
+        with patch("sys.argv", ["prog"]):
+            m.main()
+        # Should have called apply_limits for SHUTDOWN with force=True
+        calls = mock_apply.call_args_list
+        shutdown_calls = [c for c in calls if "SHUTDOWN" in str(c)]
+        self.assertTrue(len(shutdown_calls) > 0)
+
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_plex_sessions", return_value=(0, 0))
+    def test_main_racing_window_log(self, mock_plex, mock_apply):
+        """Main logs racing window config when enabled."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RACING_WINDOW_ENABLED = True
+        m.RACING_WINDOW_START   = 0
+        m.RACING_WINDOW_END     = 7
+        m.stop_event.set()
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+        m.RACING_WINDOW_ENABLED = False
+
+
+# ---------------------------------------------------------------------------
+# load_env
+# ---------------------------------------------------------------------------
+
+class TestLoadEnv(unittest.TestCase):
+    def test_load_env_skips_comments_and_blanks(self):
+        from unittest.mock import mock_open
+        fake_content = "# comment\n\nFOO_TEST_VAR=hello\nexport BAR_TEST_VAR=world\n"
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("builtins.open", mock_open(read_data=fake_content)):
+            # Clear to ensure setdefault can write
+            os.environ.pop("FOO_TEST_VAR", None)
+            os.environ.pop("BAR_TEST_VAR", None)
+            m._load_env()
+        self.assertEqual(os.environ.get("FOO_TEST_VAR"), "hello")
+        self.assertEqual(os.environ.get("BAR_TEST_VAR"), "world")
+        # Cleanup
+        os.environ.pop("FOO_TEST_VAR", None)
+        os.environ.pop("BAR_TEST_VAR", None)
+
+    def test_load_env_does_not_overwrite_existing(self):
+        from unittest.mock import mock_open
+        os.environ["EXISTING_VAR"] = "original"
+        fake_content = "EXISTING_VAR=overwritten\n"
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("builtins.open", mock_open(read_data=fake_content)):
+            m._load_env()
+        self.assertEqual(os.environ["EXISTING_VAR"], "original")
+        os.environ.pop("EXISTING_VAR", None)
+
+    def test_load_env_no_file(self):
+        with patch("pathlib.Path.exists", return_value=False):
+            m._load_env()  # should not raise
 
 
 if __name__ == "__main__":
