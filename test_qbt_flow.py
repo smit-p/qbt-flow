@@ -21,6 +21,7 @@ from urllib.error import URLError, HTTPError
 # ---------------------------------------------------------------------------
 os.environ["PLEX_TOKEN"] = "test-token"
 os.environ["QBT_INSTANCES"] = "localhost:8080:admin:adminadmin"
+os.environ["LOG_FILE"] = os.devnull  # keep test noise out of throttle.log
 
 sys.path.insert(0, str(Path(__file__).parent))
 import qbt_flow as m  # noqa: E402  (import after env setup)
