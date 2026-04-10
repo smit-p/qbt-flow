@@ -13,7 +13,7 @@ Optionally supports multiple qBittorrent instances and a racing window where one
 3. It subtracts that usage (plus a headroom multiplier) from your total line speed.
 4. The remaining bandwidth is divided between download and upload. If multiple qBittorrent instances are configured, the limit is split evenly between them (configurable), then pushed to each instance via the Web API.
 5. If no streams are active, limits are gradually ramped up (configurable steps) before going unlimited.
-6. **Racing window**: during configurable hours, the racing instance gets priority bandwidth while all other instances are hard-capped — regardless of Plex activity.
+6. **Racing window**: during configurable hours, the racing instance gets priority bandwidth while all other instances are hard-capped — regardless of stream activity.
 7. **Exponential backoff**: when the media server is unreachable, retries back off exponentially (2s → 4s → 8s … up to a configurable max) to reduce log noise and unnecessary requests.
 8. **Status endpoint**: optional HTTP server exposes a JSON snapshot at `/status` and Prometheus-compatible metrics at `/metrics`.
 9. On shutdown (SIGTERM/SIGINT), limits are automatically removed so qBittorrent isn't left throttled.
