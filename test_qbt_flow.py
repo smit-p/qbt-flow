@@ -153,6 +153,7 @@ class TestApplyLimits(unittest.TestCase):
     def setUp(self):
         m.last_dl_limit = None
         m.last_ul_limit = None
+        m.last_racing_active = None
         m.DRY_RUN = False
         m.QBT_SPLIT_BETWEEN_INSTANCES = True
         m.RACING_WINDOW_ENABLED = False
@@ -162,6 +163,7 @@ class TestApplyLimits(unittest.TestCase):
     def tearDown(self):
         m.last_dl_limit = None
         m.last_ul_limit = None
+        m.last_racing_active = None
         m.DRY_RUN = False
         m.RACING_WINDOW_ENABLED = False
 
@@ -183,6 +185,7 @@ class TestApplyLimits(unittest.TestCase):
         client = self._make_client()
         m.last_dl_limit = 50 * 1024 * 1024
         m.last_ul_limit = 25 * 1024 * 1024
+        m.last_racing_active = False  # same state as current (racing disabled)
         with patch.object(m, 'clients', [client]):
             m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE")
         client.set_speed_limits.assert_not_called()
@@ -682,6 +685,7 @@ class TestApplyLimitsRacing(unittest.TestCase):
     def setUp(self):
         m.last_dl_limit = None
         m.last_ul_limit = None
+        m.last_racing_active = None
         m.DRY_RUN = False
         m.RACING_WINDOW_ENABLED = True
         m.RACING_INSTANCE_PORT  = 39001
@@ -693,6 +697,7 @@ class TestApplyLimitsRacing(unittest.TestCase):
     def tearDown(self):
         m.last_dl_limit = None
         m.last_ul_limit = None
+        m.last_racing_active = None
         m.DRY_RUN = False
         m.RACING_WINDOW_ENABLED = False
 
@@ -784,6 +789,31 @@ class TestApplyLimitsRacing(unittest.TestCase):
             m.apply_limits(dl, ul, "THROTTLE")
         # Single instance → normal path (no split, no racing logic)
         client.set_speed_limits.assert_called_once_with(dl, ul)
+
+    def test_racing_to_normal_transition_reapplies(self):
+        """When racing ends but limits are unchanged, must still re-apply to uncap media."""
+        media  = self._make_client(39000)
+        racing = self._make_client(39001)
+
+        # First call: racing active, dl=0 (no Plex streams)
+        with patch("qbt_flow._is_racing_window", return_value=True), \
+             patch.object(m, 'clients', [media, racing]):
+            m.apply_limits(0, 0, "NORMAL")
+        # Media was capped during racing
+        media.set_speed_limits.assert_called_once_with(
+            m.RACING_NON_RACING_DL_LIMIT,
+            m.RACING_NON_RACING_UL_LIMIT,
+        )
+        media.reset_mock()
+        racing.reset_mock()
+
+        # Second call: racing ended, same dl=0 ul=0 — must NOT skip
+        with patch("qbt_flow._is_racing_window", return_value=False), \
+             patch.object(m, 'clients', [media, racing]):
+            m.apply_limits(0, 0, "NORMAL")
+        # Both should now be unlimited (0, 0)
+        media.set_speed_limits.assert_called_once_with(0, 0)
+        racing.set_speed_limits.assert_called_once_with(0, 0)
 
 
 # ---------------------------------------------------------------------------

@@ -159,6 +159,7 @@ log = logging.getLogger("qbt_flow")
 
 last_dl_limit = None
 last_ul_limit = None
+last_racing_active = None
 
 stop_event = threading.Event()
 
@@ -171,6 +172,11 @@ signal.signal(signal.SIGINT, handle_signal)
 
 # --dry-run support (set via CLI arg)
 DRY_RUN = False
+
+
+def _fmt_speed(bytes_per_sec):
+    """Format a speed value for logging: 0 → 'unlimited', else '12.3 MB/s'."""
+    return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s" if bytes_per_sec else "unlimited"
 
 # ---------------------------------------------------------------------------
 # Plex helpers
@@ -294,16 +300,16 @@ def _is_racing_window():
 
 
 def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
-    global last_dl_limit, last_ul_limit
+    global last_dl_limit, last_ul_limit, last_racing_active
 
     racing_active = _is_racing_window()
 
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
-    # But always re-apply when racing state might have changed.
+    # But always re-apply when racing state has changed.
     if not force and last_dl_limit is not None and last_ul_limit is not None:
         dl_diff = abs(dl_bytes - last_dl_limit) / max(last_dl_limit, 1)
         ul_diff = abs(ul_bytes - last_ul_limit) / max(last_ul_limit, 1)
-        if dl_diff < 0.01 and ul_diff < 0.01 and not racing_active:
+        if dl_diff < 0.01 and ul_diff < 0.01 and racing_active == last_racing_active:
             log.debug("Limits unchanged within tolerance, skipping API call")
             return
 
@@ -338,9 +344,8 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
             extra = " [RACING]" if is_racer else " [CAPPED]"
 
         if DRY_RUN:
-            dl_str = f"{c_dl / (1024 * 1024):.1f} MB/s" if c_dl else "unlimited"
-            ul_str = f"{c_ul / (1024 * 1024):.1f} MB/s" if c_ul else "unlimited"
-            log.info("[DRY-RUN] [%s] %s%s: dl=%s ul=%s%s", label, client.base, extra, dl_str, ul_str,
+            log.info("[DRY-RUN] [%s] %s%s: dl=%s ul=%s%s", label, client.base, extra,
+                     _fmt_speed(c_dl), _fmt_speed(c_ul),
                      f" ({detail})" if detail else "")
             continue
         if not client.ensure_logged_in():
@@ -348,9 +353,8 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
             continue
         ok = client.set_speed_limits(c_dl, c_ul)
         if ok:
-            dl_str = f"{c_dl / (1024 * 1024):.1f} MB/s" if c_dl else "unlimited"
-            ul_str = f"{c_ul / (1024 * 1024):.1f} MB/s" if c_ul else "unlimited"
-            log.info("[%s] %s%s: dl=%s ul=%s%s", label, client.base, extra, dl_str, ul_str,
+            log.info("[%s] %s%s: dl=%s ul=%s%s", label, client.base, extra,
+                     _fmt_speed(c_dl), _fmt_speed(c_ul),
                      f" ({detail})" if detail else "")
         else:
             client.cookie = None
@@ -358,6 +362,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
 
     last_dl_limit = dl_bytes
     last_ul_limit = ul_bytes
+    last_racing_active = racing_active
 
 # ---------------------------------------------------------------------------
 # Limit calculation
@@ -407,7 +412,7 @@ def _validate_config():
 def main():
     global DRY_RUN
 
-    parser = argparse.ArgumentParser(description="Plex-aware qBittorrent bandwidth throttle")
+    parser = argparse.ArgumentParser(description="Dynamic qBittorrent bandwidth manager")
     parser.add_argument("--dry-run", action="store_true",
                         help="Log calculated limits without applying them to qBittorrent")
     args = parser.parse_args()
