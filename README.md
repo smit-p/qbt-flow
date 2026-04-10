@@ -25,6 +25,17 @@ Dynamic bandwidth manager for qBittorrent. Adjusts download and upload speed lim
 ```bash
 git clone https://github.com/smit-p/qbt-flow.git
 cd qbt-flow
+./install.sh
+```
+
+The installer will:
+1. Check for Python 3.8+
+2. Create `config.env` from the example (and prompt you to edit it)
+3. Install and start a systemd service
+
+To run manually instead:
+
+```bash
 cp config.env.example config.env
 $EDITOR config.env   # fill in your media server URLs/tokens, QBT_INSTANCES, etc.
 python3 qbt_flow.py
@@ -160,7 +171,7 @@ curl -s http://localhost:9101/metrics
 
 ## Run as a systemd service
 
-Create `/etc/systemd/system/qbt-flow.service`:
+The `install.sh` script handles this automatically. To set it up manually instead, create `/etc/systemd/system/qbt-flow.service`:
 
 ```ini
 [Unit]
