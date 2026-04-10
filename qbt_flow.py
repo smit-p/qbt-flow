@@ -74,11 +74,31 @@ def _env_float(key, default):
 # Configuration
 # ---------------------------------------------------------------------------
 
-PLEX_URL   = _env("MEDIA_SERVER_URL", "") or _env("PLEX_URL", "http://localhost:32400")
-PLEX_TOKEN = _env("MEDIA_SERVER_TOKEN", "") or _env("PLEX_TOKEN", "")
+# Per-server configuration — set URL + token for each server to poll.
+# Streams from all configured servers are aggregated.
+PLEX_URL       = _env("PLEX_URL", "")
+PLEX_TOKEN     = _env("PLEX_TOKEN", "")
+JELLYFIN_URL   = _env("JELLYFIN_URL", "")
+JELLYFIN_TOKEN = _env("JELLYFIN_TOKEN", "")
+EMBY_URL       = _env("EMBY_URL", "")
+EMBY_TOKEN     = _env("EMBY_TOKEN", "")
 
-# Media server type: plex (default), jellyfin, emby
-MEDIA_SERVER_TYPE = _env("MEDIA_SERVER_TYPE", "plex").lower()
+# Legacy compat: MEDIA_SERVER_TYPE + MEDIA_SERVER_URL + MEDIA_SERVER_TOKEN
+_ms_type  = _env("MEDIA_SERVER_TYPE", "").lower()
+_ms_url   = _env("MEDIA_SERVER_URL", "")
+_ms_token = _env("MEDIA_SERVER_TOKEN", "")
+if _ms_url and _ms_token:
+    _target = _ms_type or "plex"
+    if _target == "plex" and not PLEX_TOKEN:
+        PLEX_URL, PLEX_TOKEN = _ms_url, _ms_token
+    elif _target == "jellyfin" and not JELLYFIN_TOKEN:
+        JELLYFIN_URL, JELLYFIN_TOKEN = _ms_url, _ms_token
+    elif _target == "emby" and not EMBY_TOKEN:
+        EMBY_URL, EMBY_TOKEN = _ms_url, _ms_token
+
+# Default Plex URL when nothing else is configured
+if not PLEX_URL and not JELLYFIN_URL and not EMBY_URL:
+    PLEX_URL = "http://localhost:32400"
 
 # qBittorrent instances as "host:port:user:pass[:scheme]" comma-separated pairs
 # e.g. QBT_INSTANCES=localhost:8080:admin:password,localhost:8443:admin:password:https
@@ -191,7 +211,7 @@ _status = {
     "ul_limit": 0,
     "racing_active": False,
     "label": "STARTING",
-    "media_server": MEDIA_SERVER_TYPE,
+    "media_servers": [],
 }
 
 stop_event = threading.Event()
@@ -246,14 +266,16 @@ class BackoffTracker:
 # Plex helpers
 # ---------------------------------------------------------------------------
 
-def get_plex_sessions():
+def get_plex_sessions(url=None, token=None):
     """
     Returns (session_count, total_bitrate_bps).
     Sums the 'bitrate' attribute from each active Session element.
     Returns (-1, 0) on error.
     """
-    url = f"{PLEX_URL}/status/sessions"
-    req = Request(url, headers={"X-Plex-Token": PLEX_TOKEN, "Accept": "application/xml"})
+    url = url or PLEX_URL
+    token = token or PLEX_TOKEN
+    req_url = f"{url}/status/sessions"
+    req = Request(req_url, headers={"X-Plex-Token": token, "Accept": "application/xml"})
     try:
         with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             body = resp.read()
@@ -286,14 +308,16 @@ def get_plex_sessions():
 # Jellyfin / Emby helpers
 # ---------------------------------------------------------------------------
 
-def _get_jellyfin_emby_sessions(path_prefix=""):
+def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix=""):
     """
     Shared Jellyfin / Emby session fetcher.
     Returns (session_count, total_bitrate_bps).  (-1, 0) on error.
     """
-    url = f"{PLEX_URL}{path_prefix}/Sessions"
-    req = Request(url, headers={
-        "X-Emby-Token": PLEX_TOKEN,
+    url = url or JELLYFIN_URL or EMBY_URL
+    token = token or JELLYFIN_TOKEN or EMBY_TOKEN
+    req_url = f"{url}{path_prefix}/Sessions"
+    req = Request(req_url, headers={
+        "X-Emby-Token": token,
         "Accept": "application/json",
     })
     try:
@@ -316,23 +340,59 @@ def _get_jellyfin_emby_sessions(path_prefix=""):
         return -1, 0
 
 
-def get_jellyfin_sessions():
+def get_jellyfin_sessions(url=None, token=None):
     """Jellyfin session fetcher."""
-    return _get_jellyfin_emby_sessions("")
+    return _get_jellyfin_emby_sessions(url, token)
 
 
-def get_emby_sessions():
+def get_emby_sessions(url=None, token=None):
     """Emby session fetcher."""
-    return _get_jellyfin_emby_sessions("/emby")
+    return _get_jellyfin_emby_sessions(url, token, "/emby")
+
+
+# ---------------------------------------------------------------------------
+# Multi-server aggregation
+# ---------------------------------------------------------------------------
+
+_configured_servers = []
+if PLEX_URL and PLEX_TOKEN:
+    _configured_servers.append(("plex", PLEX_URL, PLEX_TOKEN, get_plex_sessions))
+if JELLYFIN_URL and JELLYFIN_TOKEN:
+    _configured_servers.append(("jellyfin", JELLYFIN_URL, JELLYFIN_TOKEN, get_jellyfin_sessions))
+if EMBY_URL and EMBY_TOKEN:
+    _configured_servers.append(("emby", EMBY_URL, EMBY_TOKEN, get_emby_sessions))
+
+_status["media_servers"] = [name for name, _, _, _ in _configured_servers]
+
+_server_backoffs = {}
 
 
 def get_sessions():
-    """Dispatch to the configured media server type."""
-    if MEDIA_SERVER_TYPE == "jellyfin":
-        return get_jellyfin_sessions()
-    if MEDIA_SERVER_TYPE == "emby":
-        return get_emby_sessions()
-    return get_plex_sessions()
+    """Poll all configured media servers and aggregate active streams."""
+    total_count = 0
+    total_bps = 0
+    any_ok = False
+
+    for name, url, token, fetch_fn in _configured_servers:
+        bt = _server_backoffs.setdefault(name, BackoffTracker(BACKOFF_MAX_INTERVAL))
+        if bt.should_skip():
+            log.debug("%s backoff active, skipping", name)
+            continue
+
+        count, bps = fetch_fn(url, token)
+        if count < 0:
+            delay = bt.record_failure()
+            log.info("%s unreachable (backoff %ds)", name, delay)
+        else:
+            bt.record_success()
+            total_count += count
+            total_bps += bps
+            any_ok = True
+
+    if not any_ok:
+        return -1, 0
+    return total_count, total_bps
+
 
 # ---------------------------------------------------------------------------
 # qBittorrent helpers
@@ -563,13 +623,11 @@ def _start_status_server():
 
 def _validate_config():
     errors = []
-    if not PLEX_TOKEN:
-        token_var = "PLEX_TOKEN" if MEDIA_SERVER_TYPE == "plex" else "MEDIA_SERVER_TOKEN"
-        errors.append(f"{token_var} is not set")
+    if not _configured_servers:
+        errors.append("No media server configured \u2014 set PLEX_URL+PLEX_TOKEN, "
+                      "JELLYFIN_URL+JELLYFIN_TOKEN, or EMBY_URL+EMBY_TOKEN")
     if not QBT_INSTANCES:
         errors.append("No valid QBT_INSTANCES configured")
-    if MEDIA_SERVER_TYPE not in ("plex", "jellyfin", "emby"):
-        errors.append(f"Unsupported MEDIA_SERVER_TYPE: {MEDIA_SERVER_TYPE!r}")
     if errors:
         for e in errors:
             log.error(e)
@@ -589,9 +647,10 @@ def main():
 
     _start_time = time.monotonic()
 
-    log.info("qbt_flow starting (poll=%ds, DL=%.0f Mbps, UL=%.0f Mbps, server=%s%s)",
+    server_names = "+".join(name for name, _, _, _ in _configured_servers)
+    log.info("qbt_flow starting (poll=%ds, DL=%.0f Mbps, UL=%.0f Mbps, servers=%s%s)",
              POLL_INTERVAL, TOTAL_BANDWIDTH_BPS / 1_000_000,
-             TOTAL_UPLOAD_BPS / 1_000_000, MEDIA_SERVER_TYPE,
+             TOTAL_UPLOAD_BPS / 1_000_000, server_names,
              ", dry-run" if DRY_RUN else "")
     if RACING_WINDOW_ENABLED:
         log.info("Racing window enabled: %02d:00–%02d:00, racing port=%d, "
@@ -606,28 +665,16 @@ def main():
     ramp_remaining = 0
     ramp_dl = 0
     ramp_ul = 0
-    backoff = BackoffTracker(BACKOFF_MAX_INTERVAL)
 
     try:
         while not stop_event.is_set():
-            # Exponential backoff — skip poll while backing off
-            if backoff.should_skip():
-                log.debug("Media server backoff active, skipping check")
-                stop_event.wait(POLL_INTERVAL)
-                continue
-
             session_count, server_bps = get_sessions()
 
             if session_count < 0:
-                delay = backoff.record_failure()
                 _status["label"] = "UNREACHABLE"
-                if PLEX_UNREACHABLE_ACTION == "keep":
-                    log.info("Media server unreachable — keeping last limits (backoff %ds)", delay)
-                else:
-                    log.info("Media server unreachable — setting unlimited (backoff %ds)", delay)
+                if PLEX_UNREACHABLE_ACTION != "keep":
                     apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
             else:
-                backoff.record_success()
                 _status["streams"] = session_count
 
                 if session_count == 0:

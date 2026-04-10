@@ -515,15 +515,15 @@ class TestGetPlexSessions(unittest.TestCase):
 
 class TestValidateConfig(unittest.TestCase):
     def setUp(self):
-        self._orig_token = m.PLEX_TOKEN
+        self._orig_servers = m._configured_servers[:]
         self._orig_inst  = m.QBT_INSTANCES
 
     def tearDown(self):
-        m.PLEX_TOKEN    = self._orig_token
+        m._configured_servers[:] = self._orig_servers
         m.QBT_INSTANCES = self._orig_inst
 
-    def test_missing_token_exits(self):
-        m.PLEX_TOKEN = ""
+    def test_no_servers_exits(self):
+        m._configured_servers[:] = []
         with self.assertRaises(SystemExit):
             m._validate_config()
 
@@ -533,7 +533,7 @@ class TestValidateConfig(unittest.TestCase):
             m._validate_config()
 
     def test_valid_config_passes(self):
-        m.PLEX_TOKEN    = "valid-token"
+        m._configured_servers[:] = [("plex", "url", "tok", m.get_plex_sessions)]
         m.QBT_INSTANCES = [("host", 8080, "u", "p", "http")]
         m._validate_config()   # must not raise
 
@@ -1111,31 +1111,64 @@ class TestJellyfinEmbySessions(unittest.TestCase):
 
 class TestGetSessions(unittest.TestCase):
     def setUp(self):
-        self._orig = m.MEDIA_SERVER_TYPE
+        self._orig_servers = m._configured_servers[:]
+        self._orig_backoffs = dict(m._server_backoffs)
+        m._server_backoffs.clear()
 
     def tearDown(self):
-        m.MEDIA_SERVER_TYPE = self._orig
+        m._configured_servers[:] = self._orig_servers
+        m._server_backoffs.clear()
+        m._server_backoffs.update(self._orig_backoffs)
 
-    def test_dispatches_plex(self):
-        m.MEDIA_SERVER_TYPE = "plex"
-        with patch("qbt_flow.get_plex_sessions", return_value=(1, 100)) as mock:
-            result = m.get_sessions()
-        mock.assert_called_once()
-        self.assertEqual(result, (1, 100))
+    def test_single_server(self):
+        mock_fn = MagicMock(return_value=(2, 50_000_000))
+        m._configured_servers[:] = [("plex", "url", "tok", mock_fn)]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, 2)
+        self.assertEqual(bps, 50_000_000)
+        mock_fn.assert_called_once_with("url", "tok")
 
-    def test_dispatches_jellyfin(self):
-        m.MEDIA_SERVER_TYPE = "jellyfin"
-        with patch("qbt_flow.get_jellyfin_sessions", return_value=(2, 200)) as mock:
-            result = m.get_sessions()
-        mock.assert_called_once()
-        self.assertEqual(result, (2, 200))
+    def test_multiple_servers_aggregated(self):
+        plex_fn = MagicMock(return_value=(1, 20_000_000))
+        jf_fn = MagicMock(return_value=(2, 30_000_000))
+        m._configured_servers[:] = [("plex", "u1", "t1", plex_fn), ("jellyfin", "u2", "t2", jf_fn)]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, 3)
+        self.assertEqual(bps, 50_000_000)
 
-    def test_dispatches_emby(self):
-        m.MEDIA_SERVER_TYPE = "emby"
-        with patch("qbt_flow.get_emby_sessions", return_value=(3, 300)) as mock:
-            result = m.get_sessions()
-        mock.assert_called_once()
-        self.assertEqual(result, (3, 300))
+    def test_one_fails_other_succeeds(self):
+        fail_fn = MagicMock(return_value=(-1, 0))
+        ok_fn = MagicMock(return_value=(1, 10_000_000))
+        m._configured_servers[:] = [("plex", "u1", "t1", fail_fn), ("jellyfin", "u2", "t2", ok_fn)]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, 1)
+        self.assertEqual(bps, 10_000_000)
+
+    def test_all_fail_returns_minus_one(self):
+        fail_fn = MagicMock(return_value=(-1, 0))
+        m._configured_servers[:] = [("plex", "u1", "t1", fail_fn)]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, -1)
+        self.assertEqual(bps, 0)
+
+    def test_backoff_skips_server(self):
+        bt = m.BackoffTracker(300)
+        bt.record_failure()
+        m._server_backoffs["plex"] = bt
+        plex_fn = MagicMock(return_value=(99, 99))
+        ok_fn = MagicMock(return_value=(1, 10_000_000))
+        m._configured_servers[:] = [("plex", "u1", "t1", plex_fn), ("jellyfin", "u2", "t2", ok_fn)]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, 1)
+        plex_fn.assert_not_called()
+
+    def test_all_in_backoff_returns_minus_one(self):
+        bt = m.BackoffTracker(300)
+        bt.record_failure()
+        m._server_backoffs["plex"] = bt
+        m._configured_servers[:] = [("plex", "u1", "t1", MagicMock())]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1350,6 @@ class TestRampUp(unittest.TestCase):
 
 class TestMainBackoff(unittest.TestCase):
     def setUp(self):
-        self._orig_token = m.PLEX_TOKEN
         self._orig_inst  = m.QBT_INSTANCES
         self._orig_dry   = m.DRY_RUN
         self._orig_ramp  = m.RAMP_UP_STEPS
@@ -1325,7 +1357,6 @@ class TestMainBackoff(unittest.TestCase):
         m.POLL_INTERVAL = 0
 
     def tearDown(self):
-        m.PLEX_TOKEN    = self._orig_token
         m.QBT_INSTANCES = self._orig_inst
         m.DRY_RUN       = self._orig_dry
         m.RAMP_UP_STEPS = self._orig_ramp
@@ -1335,8 +1366,8 @@ class TestMainBackoff(unittest.TestCase):
     @patch("qbt_flow._start_status_server")
     @patch("qbt_flow.apply_limits")
     @patch("qbt_flow.get_sessions", return_value=(-1, 0))
-    def test_backoff_increases_on_repeated_failures(self, mock_sessions, mock_apply, _srv):
-        m.PLEX_TOKEN    = "test-token"
+    def test_unreachable_keep_no_apply(self, mock_sessions, mock_apply, _srv):
+        """When all servers unreachable with 'keep', apply_limits is not called."""
         m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
         m.PLEX_UNREACHABLE_ACTION = "keep"
         m.RAMP_UP_STEPS = 0
@@ -1353,42 +1384,42 @@ class TestMainBackoff(unittest.TestCase):
              patch("sys.argv", ["prog", "--dry-run"]):
             m.main()
 
-        # Should have been called (logging backoff)
+        # get_sessions was polled
         self.assertTrue(mock_sessions.call_count >= 1)
+        # With keep + dry-run, apply_limits should not be called
+        mock_apply.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
 # _validate_config — media server type
 # ---------------------------------------------------------------------------
 
-class TestValidateConfigMediaType(unittest.TestCase):
+class TestValidateConfigServers(unittest.TestCase):
     def setUp(self):
-        self._orig_token = m.PLEX_TOKEN
-        self._orig_inst  = m.QBT_INSTANCES
-        self._orig_type  = m.MEDIA_SERVER_TYPE
+        self._orig_servers = m._configured_servers[:]
+        self._orig_inst = m.QBT_INSTANCES
 
     def tearDown(self):
-        m.PLEX_TOKEN        = self._orig_token
-        m.QBT_INSTANCES     = self._orig_inst
-        m.MEDIA_SERVER_TYPE = self._orig_type
+        m._configured_servers[:] = self._orig_servers
+        m.QBT_INSTANCES = self._orig_inst
 
-    def test_invalid_media_server_type_exits(self):
-        m.PLEX_TOKEN        = "valid"
-        m.QBT_INSTANCES     = [("h", 8080, "u", "p", "http")]
-        m.MEDIA_SERVER_TYPE = "invalid"
+    def test_no_servers_exits(self):
+        m._configured_servers[:] = []
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
         with self.assertRaises(SystemExit):
             m._validate_config()
 
-    def test_jellyfin_type_accepted(self):
-        m.PLEX_TOKEN        = "valid"
-        m.QBT_INSTANCES     = [("h", 8080, "u", "p", "http")]
-        m.MEDIA_SERVER_TYPE = "jellyfin"
+    def test_plex_only_passes(self):
+        m._configured_servers[:] = [("plex", "url", "tok", m.get_plex_sessions)]
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
         m._validate_config()  # must not raise
 
-    def test_emby_type_accepted(self):
-        m.PLEX_TOKEN        = "valid"
-        m.QBT_INSTANCES     = [("h", 8080, "u", "p", "http")]
-        m.MEDIA_SERVER_TYPE = "emby"
+    def test_multiple_servers_pass(self):
+        m._configured_servers[:] = [
+            ("plex", "u1", "t1", m.get_plex_sessions),
+            ("jellyfin", "u2", "t2", m.get_jellyfin_sessions),
+        ]
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
         m._validate_config()  # must not raise
 
 

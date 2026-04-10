@@ -26,7 +26,7 @@ Dynamic bandwidth manager for qBittorrent. Adjusts download and upload speed lim
 git clone https://github.com/smit-p/qbt-flow.git
 cd qbt-flow
 cp config.env.example config.env
-$EDITOR config.env   # fill in MEDIA_SERVER_TOKEN, QBT_INSTANCES, etc.
+$EDITOR config.env   # fill in your media server URLs/tokens, QBT_INSTANCES, etc.
 python3 qbt_flow.py
 ```
 
@@ -36,9 +36,12 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEDIA_SERVER_TYPE` | `plex` | Media server type: `plex`, `jellyfin`, or `emby` |
-| `MEDIA_SERVER_URL` | `http://localhost:32400` | Media server URL (also accepts `PLEX_URL`) |
-| `MEDIA_SERVER_TOKEN` | *(required)* | Authentication token / API key (also accepts `PLEX_TOKEN`) |
+| `PLEX_URL` | *(none)* | Plex server URL. Set with `PLEX_TOKEN` to enable Plex polling |
+| `PLEX_TOKEN` | *(none)* | Plex authentication token ([how to find it](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)) |
+| `JELLYFIN_URL` | *(none)* | Jellyfin URL. Set with `JELLYFIN_TOKEN` to enable Jellyfin polling |
+| `JELLYFIN_TOKEN` | *(none)* | Jellyfin API key (Dashboard → API Keys → +) |
+| `EMBY_URL` | *(none)* | Emby URL. Set with `EMBY_TOKEN` to enable Emby polling |
+| `EMBY_TOKEN` | *(none)* | Emby API key (Dashboard → API Keys → +) |
 | `QBT_INSTANCES` | `localhost:8080:admin:adminadmin` | Comma-separated list of qBittorrent instances: `host:port:user:pass[:scheme]` |
 | `TOTAL_BANDWIDTH_BPS` | `1000000000` | Your download line speed in bits/sec (1 Gbps default) |
 | `TOTAL_UPLOAD_BPS` | *(same as download)* | Your upload line speed in bits/sec — set for asymmetric connections |
@@ -50,9 +53,9 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `PLEX_OVERHEAD_FACTOR` | `1.25` | Multiplier on stream bitrates to account for buffering |
 | `POLL_INTERVAL` | `15` | Seconds between media server session polls |
 | `REQUEST_TIMEOUT` | `10` | HTTP request timeout in seconds |
-| `PLEX_UNREACHABLE_ACTION` | `keep` | What to do when the media server is down: `keep` (retain last limits) or `unlimited` |
+| `PLEX_UNREACHABLE_ACTION` | `keep` | What to do when all media servers are down: `keep` (retain last limits) or `unlimited` |
 | `RAMP_UP_STEPS` | `3` | Cycles to ramp from throttled → unlimited when streams stop (0 = instant). Each step doubles the limit |
-| `BACKOFF_MAX_INTERVAL` | `300` | Max exponential backoff (seconds) when the media server is unreachable |
+| `BACKOFF_MAX_INTERVAL` | `300` | Max per-server exponential backoff (seconds) when a media server is unreachable |
 | `STATUS_PORT` | `0` (disabled) | Port for the status/metrics HTTP endpoint. Set to e.g. `9101` to enable |
 | `LOG_FILE` | `throttle.log` (in script dir) | Log file path |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
@@ -112,19 +115,22 @@ RACING_NON_RACING_DL_LIMIT=1048576   # 1 MB/s
 RACING_NON_RACING_UL_LIMIT=1048576   # 1 MB/s
 ```
 
-### Jellyfin / Emby support
+### Multi-server support
 
-Set `MEDIA_SERVER_TYPE` to `jellyfin` or `emby` and point to your server:
+qbt-flow can poll **multiple media servers simultaneously**. Set URL + token for each server you want to monitor — streams from all configured servers are aggregated into a single bandwidth calculation.
 
 ```env
-MEDIA_SERVER_TYPE=jellyfin
-MEDIA_SERVER_URL=http://localhost:8096
-MEDIA_SERVER_TOKEN=your-api-key
+# Both Plex and Jellyfin active — streams are summed
+PLEX_URL=http://localhost:32400
+PLEX_TOKEN=your-plex-token
+
+JELLYFIN_URL=http://localhost:8096
+JELLYFIN_TOKEN=your-jellyfin-api-key
 ```
 
-For Emby the URL is the same (`http://host:8096`); qbt-flow adds the `/emby/` prefix automatically.
+Each server has its own exponential backoff tracker — if one goes down, the others continue working. For Emby, the URL is typically `http://host:8920`; qbt-flow adds the `/emby/` prefix automatically.
 
-The old `PLEX_URL` / `PLEX_TOKEN` variables still work as aliases — existing configs don't need any changes.
+The legacy `MEDIA_SERVER_TYPE` + `MEDIA_SERVER_URL` + `MEDIA_SERVER_TOKEN` config still works for single-server setups and is mapped to the right `*_URL`/`*_TOKEN` pair automatically.
 
 ### Gradual ramp-up
 
@@ -134,7 +140,7 @@ When streams stop, bandwidth limits ramp up gradually instead of jumping straigh
 
 ### Exponential backoff
 
-If the media server is unreachable, qbt-flow backs off exponentially (2, 4, 8 … seconds) up to `BACKOFF_MAX_INTERVAL` (default: 300 s). Once the server responds again, polling resumes at normal speed. This prevents hammering a downed server with requests every `POLL_INTERVAL` seconds.
+If the media server is unreachable, qbt-flow backs off exponentially (2, 4, 8 … seconds) up to `BACKOFF_MAX_INTERVAL` (default: 300 s). Each configured server has its own backoff tracker, so one server going down doesn’t affect polling of the others. Once a server responds again, its polling resumes at normal speed.
 
 ### Status / metrics endpoint
 
@@ -144,7 +150,7 @@ Set `STATUS_PORT` to expose a lightweight HTTP status page:
 STATUS_PORT=9101
 ```
 
-- `GET /` or `GET /status` — JSON snapshot (streams, limits, uptime, media server type).
+- `GET /` or `GET /status` — JSON snapshot (streams, limits, uptime, configured servers).
 - `GET /metrics` — Prometheus-compatible text format.
 
 ```bash
@@ -190,7 +196,7 @@ journalctl -u qbt-flow -f
 Logs are written to `throttle.log` in the script directory (configurable via `LOG_FILE`). Logs are automatically rotated at 5 MB with 3 backups kept. Set `LOG_LEVEL=DEBUG` for verbose output. Sample output:
 
 ```
-2026-01-15 14:23:01 INFO qbt_flow starting (poll=5s, DL=1000 Mbps, UL=1000 Mbps, server=plex)
+2026-01-15 14:23:01 INFO qbt_flow starting (poll=5s, DL=1000 Mbps, UL=1000 Mbps, servers=plex+jellyfin)
 2026-01-15 14:23:01 INFO [THROTTLE] http://localhost:39000: dl=47.4 MB/s ul=53.3 MB/s (2 stream(s), using ~43 Mbps, remaining DL 946 Mbps / UL 946 Mbps)
 2026-01-15 14:23:01 INFO [THROTTLE] http://localhost:39001: dl=47.4 MB/s ul=53.3 MB/s (2 stream(s), using ~43 Mbps, remaining DL 946 Mbps / UL 946 Mbps)
 2026-01-15 14:23:06 INFO [RAMP-UP] http://localhost:39000: dl=95.0 MB/s ul=106.6 MB/s (step 3/3)
