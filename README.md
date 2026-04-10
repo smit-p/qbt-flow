@@ -54,8 +54,8 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `RACING_WINDOW_START` | `0` | Racing window start hour (24h, inclusive) |
 | `RACING_WINDOW_END` | `7` | Racing window end hour (24h, exclusive) |
 | `RACING_INSTANCE_PORT` | `39001` | Port of the racing qBittorrent instance |
-| `RACING_NON_RACING_DL_LIMIT` | `5242880` (5 MB/s) | Download cap for non-racing instances during the window |
-| `RACING_NON_RACING_UL_LIMIT` | `5242880` (5 MB/s) | Upload cap for non-racing instances during the window |
+| `RACING_NON_RACING_DL_LIMIT` | `1048576` (1 MB/s) | Download cap for non-racing instances during the window |
+| `RACING_NON_RACING_UL_LIMIT` | `1048576` (1 MB/s) | Upload cap for non-racing instances during the window |
 
 ### Multiple qBittorrent instances
 
@@ -91,7 +91,7 @@ If `TOTAL_BANDWIDTH_BPS=1000000000` (1 Gbps) and Plex is streaming a 20 Mbps 4K 
 
 ### Racing window
 
-When `RACING_WINDOW_ENABLED=true`, during the configured hours (default: midnight to 7 AM), the racing instance gets all available bandwidth while other instances are hard-capped at `RACING_NON_RACING_DL_LIMIT` / `RACING_NON_RACING_UL_LIMIT` (default: 5 MB/s each). This prevents long-term media downloads from competing with time-sensitive racing torrents.
+When `RACING_WINDOW_ENABLED=true`, during the configured hours (default: midnight to 7 AM), the racing instance gets all available bandwidth while other instances are hard-capped at `RACING_NON_RACING_DL_LIMIT` / `RACING_NON_RACING_UL_LIMIT` (default: 1 MB/s each). This prevents long-term media downloads from competing with time-sensitive racing torrents.
 
 The window supports midnight wrapping — e.g. `RACING_WINDOW_START=22` and `RACING_WINDOW_END=6` covers 10 PM to 6 AM.
 
@@ -102,8 +102,8 @@ RACING_WINDOW_ENABLED=true
 RACING_WINDOW_START=0
 RACING_WINDOW_END=7
 RACING_INSTANCE_PORT=39001
-RACING_NON_RACING_DL_LIMIT=5242880   # 5 MB/s
-RACING_NON_RACING_UL_LIMIT=5242880   # 5 MB/s
+RACING_NON_RACING_DL_LIMIT=1048576   # 1 MB/s
+RACING_NON_RACING_UL_LIMIT=1048576   # 1 MB/s
 ```
 
 ## Run as a systemd service

@@ -131,8 +131,8 @@ RACING_INSTANCE_PORT  = _env_int("RACING_INSTANCE_PORT", 39001)
 
 # Hard caps for the NON-racing instance during the racing window (bytes/sec).
 # These override the normal calculated limits for that instance only.
-RACING_NON_RACING_DL_LIMIT = _env_int("RACING_NON_RACING_DL_LIMIT", 5 * 1024 * 1024)   # 5 MB/s
-RACING_NON_RACING_UL_LIMIT = _env_int("RACING_NON_RACING_UL_LIMIT", 5 * 1024 * 1024)   # 5 MB/s
+RACING_NON_RACING_DL_LIMIT = _env_int("RACING_NON_RACING_DL_LIMIT", 1 * 1024 * 1024)   # 1 MB/s
+RACING_NON_RACING_UL_LIMIT = _env_int("RACING_NON_RACING_UL_LIMIT", 1 * 1024 * 1024)   # 1 MB/s
 
 LOG_FILE  = _env("LOG_FILE", str(_SCRIPT_DIR / "throttle.log"))
 LOG_LEVEL = getattr(logging, _env("LOG_LEVEL", "INFO").upper(), logging.INFO)
