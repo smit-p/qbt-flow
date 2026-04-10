@@ -95,6 +95,84 @@ class TestParseQbtInstances(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _parse_speed
+# ---------------------------------------------------------------------------
+
+class TestParseSpeed(unittest.TestCase):
+    # -- Bits per second (ISP-style) --
+    def test_gbps(self):
+        self.assertEqual(m._parse_speed("1Gbps"), 1_000_000_000)
+
+    def test_mbps(self):
+        self.assertEqual(m._parse_speed("500Mbps"), 500_000_000)
+
+    def test_kbps(self):
+        self.assertEqual(m._parse_speed("8000Kbps"), 8_000_000)
+
+    def test_bps(self):
+        self.assertEqual(m._parse_speed("1000bps"), 1000)
+
+    # -- Bytes per second (app-style) --
+    def test_mb_per_sec(self):
+        self.assertEqual(m._parse_speed("10MB/s"), 10 * 1024 * 1024)
+
+    def test_kb_per_sec(self):
+        self.assertEqual(m._parse_speed("512KB/s"), 512 * 1024)
+
+    def test_gb_per_sec(self):
+        self.assertEqual(m._parse_speed("1GB/s"), 1024**3)
+
+    # -- Case insensitivity --
+    def test_case_insensitive(self):
+        self.assertEqual(m._parse_speed("1gbps"), 1_000_000_000)
+        self.assertEqual(m._parse_speed("10mb/s"), 10 * 1024 * 1024)
+
+    # -- Plain numbers (backward compat) --
+    def test_plain_int(self):
+        self.assertEqual(m._parse_speed("1000000000"), 1_000_000_000)
+
+    def test_plain_float(self):
+        self.assertEqual(m._parse_speed("1.5"), 1.5)
+
+    def test_numeric_passthrough(self):
+        self.assertEqual(m._parse_speed(500_000_000), 500_000_000)
+
+    # -- Edge cases --
+    def test_empty_string(self):
+        self.assertEqual(m._parse_speed(""), 0)
+
+    def test_whitespace(self):
+        self.assertEqual(m._parse_speed("  500Mbps  "), 500_000_000)
+
+    def test_fractional_with_suffix(self):
+        self.assertEqual(m._parse_speed("1.5Gbps"), 1_500_000_000)
+
+    def test_unrecognised_suffix_returns_zero(self):
+        self.assertEqual(m._parse_speed("10xyz"), 0)
+
+
+class TestEnvSpeed(unittest.TestCase):
+    """Verify _env_speed reads key and falls back to default."""
+
+    def test_env_var_with_suffix(self):
+        with patch.dict(os.environ, {"TOTAL_BANDWIDTH": "500Mbps"}, clear=False):
+            val = m._env_speed("TOTAL_BANDWIDTH", 1_000_000_000)
+        self.assertEqual(val, 500_000_000)
+
+    def test_env_var_plain_number(self):
+        with patch.dict(os.environ, {"TOTAL_BANDWIDTH": "100000000"}, clear=False):
+            val = m._env_speed("TOTAL_BANDWIDTH", 1_000_000_000)
+        self.assertEqual(val, 100_000_000)
+
+    def test_default_used(self):
+        env = os.environ.copy()
+        env.pop("TOTAL_BANDWIDTH", None)
+        with patch.dict(os.environ, env, clear=True):
+            val = m._env_speed("TOTAL_BANDWIDTH", 1_000_000_000)
+        self.assertEqual(val, 1_000_000_000)
+
+
+# ---------------------------------------------------------------------------
 # calculate_limits
 # ---------------------------------------------------------------------------
 

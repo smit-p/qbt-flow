@@ -60,13 +60,13 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `EMBY_URL` | *(none)* | Emby URL. Set with `EMBY_TOKEN` to enable Emby polling |
 | `EMBY_TOKEN` | *(none)* | Emby API key (Dashboard → API Keys → +) |
 | `QBT_INSTANCES` | *(none — required)* | Comma-separated list of qBittorrent instances: `host:port:user:pass[:scheme]` |
-| `TOTAL_BANDWIDTH_BPS` | `1000000000` | Your download line speed in bits/sec (1 Gbps default) |
-| `TOTAL_UPLOAD_BPS` | *(same as download)* | Your upload line speed in bits/sec — set for asymmetric connections |
+| `TOTAL_BANDWIDTH` | `1Gbps` | Your download line speed. Accepts suffixes: `Mbps`, `Gbps` (bits/sec) or `MB/s`, `GB/s` (bytes/sec). Plain numbers = bits/sec |
+| `TOTAL_UPLOAD` | *(same as download)* | Your upload line speed — set for asymmetric connections |
 | `QBT_HEADROOM_FRACTION` | `0.8` | Fraction of remaining bandwidth to give qbt (download) |
 | `QBT_UPLOAD_FRACTION` | `0.9` | Fraction of remaining bandwidth to give qbt (upload) |
 | `QBT_SPLIT_BETWEEN_INSTANCES` | `true` | Split bandwidth evenly across instances (set `false` to give each the full amount) |
-| `MIN_QBT_DL_BYTES` | `10485760` (10 MB/s) | Minimum download limit — qbt is never throttled below this |
-| `MIN_QBT_UL_BYTES` | `5242880` (5 MB/s) | Minimum upload limit |
+| `MIN_QBT_DL` | `10MB/s` | Minimum download limit — qbt is never throttled below this |
+| `MIN_QBT_UL` | `5MB/s` | Minimum upload limit |
 | `PLEX_OVERHEAD_FACTOR` | `1.25` | Multiplier on stream bitrates to account for buffering |
 | `POLL_INTERVAL` | `15` | Seconds between media server session polls |
 | `REQUEST_TIMEOUT` | `10` | HTTP request timeout in seconds |
@@ -80,8 +80,8 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `RACING_WINDOW_START` | `0` | Racing window start hour (24h, inclusive) |
 | `RACING_WINDOW_END` | `7` | Racing window end hour (24h, exclusive) |
 | `RACING_INSTANCE_PORT` | `39001` | Port of the racing qBittorrent instance |
-| `RACING_NON_RACING_DL_LIMIT` | `1048576` (1 MB/s) | Download cap for non-racing instances during the window |
-| `RACING_NON_RACING_UL_LIMIT` | `1048576` (1 MB/s) | Upload cap for non-racing instances during the window |
+| `RACING_NON_RACING_DL_LIMIT` | `1MB/s` | Download cap for non-racing instances during the window |
+| `RACING_NON_RACING_UL_LIMIT` | `1MB/s` | Upload cap for non-racing instances during the window |
 
 ### Multiple qBittorrent instances
 
@@ -102,15 +102,15 @@ QBT_INSTANCES=myserver:8443:admin:pass1:https
 If your upload speed differs from download (common on cable/fibre), set both:
 
 ```env
-TOTAL_BANDWIDTH_BPS=1000000000   # 1 Gbps down
-TOTAL_UPLOAD_BPS=50000000        # 50 Mbps up
+TOTAL_BANDWIDTH=1Gbps     # 1 Gbps down
+TOTAL_UPLOAD=50Mbps       # 50 Mbps up
 ```
 
 Upload limits will then be calculated against the upload total separately.
 
 ### Bandwidth example
 
-If `TOTAL_BANDWIDTH_BPS=1000000000` (1 Gbps) and your media server is streaming a 20 Mbps 4K file:
+If `TOTAL_BANDWIDTH=1Gbps` and your media server is streaming a 20 Mbps 4K file:
 - Stream usage = 20 Mbps × 1.25 overhead = 25 Mbps
 - Remaining = 975 Mbps
 - qbt download limit = 975 × 0.8 = 780 Mbps = ~97.5 MB/s

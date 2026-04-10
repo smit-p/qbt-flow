@@ -70,6 +70,47 @@ def _env_float(key, default):
     except (ValueError, TypeError):
         return default
 
+# Speed-suffix multipliers (case-insensitive lookup)
+_SPEED_MULTIPLIERS = {
+    # bits per second (SI / base-1000 — what ISPs advertise)
+    "bps": 1, "kbps": 1_000, "mbps": 1_000_000, "gbps": 1_000_000_000,
+    # bytes per second (binary / base-1024 — what apps display)
+    "b/s": 1, "kb/s": 1024, "mb/s": 1024**2, "gb/s": 1024**3,
+}
+_SPEED_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z/]+)\s*$")
+
+def _parse_speed(raw):
+    """Parse a human-readable speed value into a number.
+
+    Accepts plain numbers (returned as-is) or numbers with a suffix:
+      Bits/sec:  Kbps, Mbps, Gbps   (e.g. "1Gbps" → 1 000 000 000)
+      Bytes/sec: KB/s, MB/s, GB/s   (e.g. "10MB/s" → 10 485 760)
+    """
+    if isinstance(raw, (int, float)):
+        return raw
+    raw = str(raw).strip()
+    if not raw:
+        return 0
+    m = _SPEED_RE.match(raw)
+    if m:
+        number = float(m.group(1))
+        suffix = m.group(2).lower()
+        mult = _SPEED_MULTIPLIERS.get(suffix)
+        if mult is not None:
+            return number * mult
+    # Plain number or unrecognised suffix — fall through to float()
+    try:
+        return float(raw)
+    except ValueError:
+        return 0
+
+def _env_speed(key, default):
+    """Read a speed env-var, returning *default* if unset."""
+    val = os.environ.get(key)
+    if val is not None:
+        return _parse_speed(val)
+    return default
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -123,10 +164,11 @@ def _parse_qbt_instances():
 
 QBT_INSTANCES = _parse_qbt_instances()
 
-# Your line speed in bits per second (download)
-TOTAL_BANDWIDTH_BPS   = _env_float("TOTAL_BANDWIDTH_BPS", 1_000_000_000)  # 1 Gbps
-# Upload line speed — defaults to TOTAL_BANDWIDTH_BPS if not set
-TOTAL_UPLOAD_BPS      = _env_float("TOTAL_UPLOAD_BPS", TOTAL_BANDWIDTH_BPS)
+# Your line speed (download).  Accepts plain numbers (bits/sec) or suffixes:
+#   1Gbps, 500Mbps, 100Mbps, etc.
+TOTAL_BANDWIDTH_BPS   = _env_speed("TOTAL_BANDWIDTH", 1_000_000_000)  # 1 Gbps
+# Upload line speed — defaults to TOTAL_BANDWIDTH if not set
+TOTAL_UPLOAD_BPS      = _env_speed("TOTAL_UPLOAD", TOTAL_BANDWIDTH_BPS)
 
 # Fraction of remaining bandwidth (after Plex) to give qBittorrent.
 QBT_HEADROOM_FRACTION = _env_float("QBT_HEADROOM_FRACTION", 0.8)
@@ -136,9 +178,10 @@ QBT_UPLOAD_FRACTION   = _env_float("QBT_UPLOAD_FRACTION",   0.9)
 # If true, each instance gets (total / N). If false, each gets the full amount.
 QBT_SPLIT_BETWEEN_INSTANCES = _env("QBT_SPLIT_BETWEEN_INSTANCES", "true").lower() in ("true", "1", "yes")
 
-# Hard floor: never throttle qbt below this (bytes/sec)
-MIN_QBT_DL_BYTES = _env_int("MIN_QBT_DL_BYTES", 10 * 1024 * 1024)   # 10 MB/s
-MIN_QBT_UL_BYTES = _env_int("MIN_QBT_UL_BYTES",  5 * 1024 * 1024)   #  5 MB/s
+# Hard floor: never throttle qbt below this.  Accepts plain numbers (bytes/sec)
+# or suffixes: 10MB/s, 5MB/s, etc.
+MIN_QBT_DL_BYTES = int(_env_speed("MIN_QBT_DL", 10 * 1024 * 1024))   # 10 MB/s
+MIN_QBT_UL_BYTES = int(_env_speed("MIN_QBT_UL",  5 * 1024 * 1024))   #  5 MB/s
 
 # When no streams are active, remove all limits.
 NORMAL_DL_BYTES = 0  # unlimited
@@ -172,10 +215,10 @@ RACING_WINDOW_START   = _env_int("RACING_WINDOW_START", 0)    # hour (0-23), e.g
 RACING_WINDOW_END     = _env_int("RACING_WINDOW_END",   7)    # hour (0-23), e.g. 7 = 7 AM
 RACING_INSTANCE_PORT  = _env_int("RACING_INSTANCE_PORT", 39001)
 
-# Hard caps for the NON-racing instance during the racing window (bytes/sec).
-# These override the normal calculated limits for that instance only.
-RACING_NON_RACING_DL_LIMIT = _env_int("RACING_NON_RACING_DL_LIMIT", 1 * 1024 * 1024)   # 1 MB/s
-RACING_NON_RACING_UL_LIMIT = _env_int("RACING_NON_RACING_UL_LIMIT", 1 * 1024 * 1024)   # 1 MB/s
+# Hard caps for the NON-racing instance during the racing window.
+# Accepts plain numbers (bytes/sec) or suffixes: 1MB/s, 512KB/s, etc.
+RACING_NON_RACING_DL_LIMIT = int(_env_speed("RACING_NON_RACING_DL_LIMIT", 1 * 1024 * 1024))   # 1 MB/s
+RACING_NON_RACING_UL_LIMIT = int(_env_speed("RACING_NON_RACING_UL_LIMIT", 1 * 1024 * 1024))   # 1 MB/s
 
 LOG_FILE  = _env("LOG_FILE", str(_SCRIPT_DIR / "throttle.log"))
 LOG_LEVEL = getattr(logging, _env("LOG_LEVEL", "INFO").upper(), logging.INFO)
