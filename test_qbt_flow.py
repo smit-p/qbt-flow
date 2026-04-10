@@ -1262,6 +1262,28 @@ class TestStatusEndpoint(unittest.TestCase):
         self.assertIsNone(result)
         m.STATUS_PORT = orig
 
+    def test_start_status_server_success(self):
+        """Status server binds and returns a server object."""
+        orig = m.STATUS_PORT
+        m.STATUS_PORT = 19876  # unlikely to be in use
+        try:
+            server = m._start_status_server()
+            self.assertIsNotNone(server)
+            server.shutdown()
+        finally:
+            m.STATUS_PORT = orig
+
+    def test_start_status_server_port_in_use(self):
+        """OSError when port is already bound returns None."""
+        orig = m.STATUS_PORT
+        m.STATUS_PORT = 19877
+        try:
+            with patch("qbt_flow.HTTPServer", side_effect=OSError("Address already in use")):
+                result = m._start_status_server()
+            self.assertIsNone(result)
+        finally:
+            m.STATUS_PORT = orig
+
     def test_log_message_suppressed(self):
         handler = MagicMock(spec=m._StatusHandler)
         m._StatusHandler.log_message(handler, "test %s", "arg")
@@ -1391,6 +1413,86 @@ class TestRampUp(unittest.TestCase):
         # Should NOT have any RAMP-UP labels
         labels = [c.args[2] for c in mock_apply.call_args_list if len(c.args) > 2]
         self.assertNotIn("RAMP-UP", labels)
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_ramp_overflow_goes_unlimited(self, mock_sessions, mock_apply, _srv):
+        """Ramp-up doubling past max bandwidth jumps straight to NORMAL."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 10  # many steps so doubling overflows quickly
+        orig_bw = m.TOTAL_BANDWIDTH_BPS
+        m.TOTAL_BANDWIDTH_BPS = 100_000_000  # 100 Mbps → max_bw = 12.5 MB/s
+
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (1, 50_000_000)
+            return (0, 0)
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            if apply_count[0] == 1:
+                # Set high enough so doubling overflows max_bw (12.5 MB/s)
+                m.last_dl_limit = 10_000_000  # 10 MB/s → *2 = 20 MB/s > 12.5
+                m.last_ul_limit = 10_000_000
+            if apply_count[0] >= 4:
+                m.stop_event.set()
+
+        mock_apply.side_effect = apply_side_effect
+
+        try:
+            with patch("sys.argv", ["prog", "--dry-run"]):
+                m.main()
+        finally:
+            m.TOTAL_BANDWIDTH_BPS = orig_bw
+
+        labels = [c.args[2] for c in mock_apply.call_args_list]
+        # Overflow triggers immediate NORMAL instead of RAMP-UP
+        self.assertIn("NORMAL", labels)
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_ramp_completes_naturally(self, mock_sessions, mock_apply, _srv):
+        """Ramp with small limit completes all steps without overflowing."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 2  # 2 steps: one RAMP-UP, final → NORMAL
+
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (1, 50_000_000)
+            return (0, 0)
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            if apply_count[0] == 1:
+                # Small value so doubling stays well under max_bw
+                m.last_dl_limit = 1_000_000   # 1 MB/s → *2 = 2 MB/s << 125 MB/s
+                m.last_ul_limit = 500_000
+            if apply_count[0] >= 5:
+                m.stop_event.set()
+
+        mock_apply.side_effect = apply_side_effect
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        labels = [c.args[2] for c in mock_apply.call_args_list]
+        # Should see RAMP-UP then NORMAL when ramp_remaining hits 0
+        self.assertIn("RAMP-UP", labels)
+        self.assertIn("NORMAL", labels)
 
 
 # ---------------------------------------------------------------------------
