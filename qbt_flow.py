@@ -2,23 +2,33 @@
 """
 qbt_flow.py
 Dynamic bandwidth manager for qBittorrent instances.
-Throttles download/upload limits based on active Plex streams and prioritises
-a racing instance during a configurable time window.
+Throttles download/upload limits based on active media-server streams
+(Plex, Jellyfin, or Emby) and prioritises a racing instance during a
+configurable time window.
+
+Features:
+- Gradual ramp-up when streams stop (configurable steps)
+- Exponential backoff on media-server failures
+- Optional status/metrics HTTP endpoint
+- Racing-window bandwidth priority
 
 Configuration is loaded from a config.env file in the same directory, or
 from environment variables. Copy config.env.example to config.env to get started.
 """
 
 import argparse
+import json
 import os
 import re
+import signal
+import sys
 import threading
+import time
 import logging
 import logging.handlers
-import sys
-import signal
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
@@ -64,8 +74,11 @@ def _env_float(key, default):
 # Configuration
 # ---------------------------------------------------------------------------
 
-PLEX_URL   = _env("PLEX_URL", "http://localhost:32400")
-PLEX_TOKEN = _env("PLEX_TOKEN")
+PLEX_URL   = _env("MEDIA_SERVER_URL", "") or _env("PLEX_URL", "http://localhost:32400")
+PLEX_TOKEN = _env("MEDIA_SERVER_TOKEN", "") or _env("PLEX_TOKEN", "")
+
+# Media server type: plex (default), jellyfin, emby
+MEDIA_SERVER_TYPE = _env("MEDIA_SERVER_TYPE", "plex").lower()
 
 # qBittorrent instances as "host:port:user:pass[:scheme]" comma-separated pairs
 # e.g. QBT_INSTANCES=localhost:8080:admin:password,localhost:8443:admin:password:https
@@ -114,11 +127,21 @@ NORMAL_UL_BYTES = 0  # unlimited
 # Safety buffer added on top of reported Plex bitrate
 PLEX_OVERHEAD_FACTOR = _env_float("PLEX_OVERHEAD_FACTOR", 1.25)
 
-POLL_INTERVAL   = _env_int("POLL_INTERVAL",   15)   # seconds between Plex checks
+POLL_INTERVAL   = _env_int("POLL_INTERVAL",   15)   # seconds between checks
 REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 10)
 
-# Behavior when Plex is unreachable: "unlimited" (remove limits), "keep" (keep last limits)
+# Behavior when media server is unreachable: "unlimited" or "keep" (last limits)
 PLEX_UNREACHABLE_ACTION = _env("PLEX_UNREACHABLE_ACTION", "keep")
+
+# Gradual ramp-up when streams stop: number of cycles (including final
+# unlimited) before removing all limits.  0 = instant.  Each step doubles.
+RAMP_UP_STEPS = _env_int("RAMP_UP_STEPS", 3)
+
+# Max exponential-backoff interval (seconds) when the media server is unreachable
+BACKOFF_MAX_INTERVAL = _env_int("BACKOFF_MAX_INTERVAL", 300)
+
+# Status / metrics HTTP endpoint (0 = disabled)
+STATUS_PORT = _env_int("STATUS_PORT", 0)
 
 # ---------------------------------------------------------------------------
 # Racing window — during this time window the racing instance gets priority
@@ -161,6 +184,16 @@ last_dl_limit = None
 last_ul_limit = None
 last_racing_active = None
 
+_start_time = 0.0
+_status = {
+    "streams": 0,
+    "dl_limit": 0,
+    "ul_limit": 0,
+    "racing_active": False,
+    "label": "STARTING",
+    "media_server": MEDIA_SERVER_TYPE,
+}
+
 stop_event = threading.Event()
 
 def handle_signal(signum, frame):
@@ -177,6 +210,37 @@ DRY_RUN = False
 def _fmt_speed(bytes_per_sec):
     """Format a speed value for logging: 0 → 'unlimited', else '12.3 MB/s'."""
     return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s" if bytes_per_sec else "unlimited"
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff
+# ---------------------------------------------------------------------------
+
+class BackoffTracker:
+    """Exponential backoff with configurable ceiling."""
+
+    def __init__(self, max_interval=300):
+        self.max_interval = max_interval
+        self.failures = 0
+        self._next_retry = 0.0
+
+    def should_skip(self):
+        return self.failures > 0 and time.monotonic() < self._next_retry
+
+    def record_failure(self):
+        self.failures += 1
+        delay = min(2 ** self.failures, self.max_interval)
+        self._next_retry = time.monotonic() + delay
+        return delay
+
+    def record_success(self):
+        self.failures = 0
+        self._next_retry = 0.0
+
+    def current_delay(self):
+        if self.failures == 0:
+            return 0
+        return min(2 ** self.failures, self.max_interval)
 
 # ---------------------------------------------------------------------------
 # Plex helpers
@@ -217,6 +281,58 @@ def get_plex_sessions():
     except (URLError, HTTPError, ET.ParseError, ValueError) as e:
         log.warning("Plex session check failed: %s", e)
         return -1, 0
+
+# ---------------------------------------------------------------------------
+# Jellyfin / Emby helpers
+# ---------------------------------------------------------------------------
+
+def _get_jellyfin_emby_sessions(path_prefix=""):
+    """
+    Shared Jellyfin / Emby session fetcher.
+    Returns (session_count, total_bitrate_bps).  (-1, 0) on error.
+    """
+    url = f"{PLEX_URL}{path_prefix}/Sessions"
+    req = Request(url, headers={
+        "X-Emby-Token": PLEX_TOKEN,
+        "Accept": "application/json",
+    })
+    try:
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+        count = 0
+        total_bps = 0
+        for session in data:
+            now_playing = session.get("NowPlayingItem")
+            if not now_playing:
+                continue
+            play_state = session.get("PlayState", {})
+            if play_state.get("IsPaused", False):
+                continue
+            count += 1
+            total_bps += now_playing.get("Bitrate", 0)
+        return count, total_bps
+    except (URLError, HTTPError, json.JSONDecodeError, ValueError, KeyError) as e:
+        log.warning("Media server session check failed: %s", e)
+        return -1, 0
+
+
+def get_jellyfin_sessions():
+    """Jellyfin session fetcher."""
+    return _get_jellyfin_emby_sessions("")
+
+
+def get_emby_sessions():
+    """Emby session fetcher."""
+    return _get_jellyfin_emby_sessions("/emby")
+
+
+def get_sessions():
+    """Dispatch to the configured media server type."""
+    if MEDIA_SERVER_TYPE == "jellyfin":
+        return get_jellyfin_sessions()
+    if MEDIA_SERVER_TYPE == "emby":
+        return get_emby_sessions()
+    return get_plex_sessions()
 
 # ---------------------------------------------------------------------------
 # qBittorrent helpers
@@ -388,10 +504,58 @@ def calculate_limits(session_count, plex_bps):
 
     plex_mbps = plex_bps / 1_000_000
     detail = (f"{session_count} stream(s), "
-              f"Plex using ~{plex_mbps:.0f} Mbps, "
+              f"using ~{plex_mbps:.0f} Mbps, "
               f"remaining DL {remaining_dl_bps / 1_000_000:.0f} Mbps / UL {remaining_ul_bps / 1_000_000:.0f} Mbps")
 
     return dl_bytes, ul_bytes, detail
+
+# ---------------------------------------------------------------------------
+# Status / metrics endpoint
+# ---------------------------------------------------------------------------
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/status", "/"):
+            _status["uptime_seconds"] = int(time.monotonic() - _start_time)
+            body = json.dumps(_status, indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/metrics":
+            _status["uptime_seconds"] = int(time.monotonic() - _start_time)
+            lines = [
+                f'qbt_flow_streams {_status["streams"]}',
+                f'qbt_flow_dl_limit_bytes {_status["dl_limit"]}',
+                f'qbt_flow_ul_limit_bytes {_status["ul_limit"]}',
+                f'qbt_flow_racing_active {1 if _status["racing_active"] else 0}',
+                f'qbt_flow_uptime_seconds {_status["uptime_seconds"]}',
+            ]
+            body = "\n".join(lines).encode() + b"\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress default access log
+
+
+def _start_status_server():
+    if not STATUS_PORT:
+        return None
+    try:
+        server = HTTPServer(("", STATUS_PORT), _StatusHandler)
+    except OSError as e:
+        log.warning("Cannot start status server on port %d: %s", STATUS_PORT, e)
+        return None
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info("Status endpoint listening on port %d", STATUS_PORT)
+    return server
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -400,9 +564,12 @@ def calculate_limits(session_count, plex_bps):
 def _validate_config():
     errors = []
     if not PLEX_TOKEN:
-        errors.append("PLEX_TOKEN is not set")
+        token_var = "PLEX_TOKEN" if MEDIA_SERVER_TYPE == "plex" else "MEDIA_SERVER_TOKEN"
+        errors.append(f"{token_var} is not set")
     if not QBT_INSTANCES:
         errors.append("No valid QBT_INSTANCES configured")
+    if MEDIA_SERVER_TYPE not in ("plex", "jellyfin", "emby"):
+        errors.append(f"Unsupported MEDIA_SERVER_TYPE: {MEDIA_SERVER_TYPE!r}")
     if errors:
         for e in errors:
             log.error(e)
@@ -410,7 +577,7 @@ def _validate_config():
 
 
 def main():
-    global DRY_RUN
+    global DRY_RUN, _start_time
 
     parser = argparse.ArgumentParser(description="Dynamic qBittorrent bandwidth manager")
     parser.add_argument("--dry-run", action="store_true",
@@ -420,9 +587,11 @@ def main():
 
     _validate_config()
 
-    log.info("qbt_flow starting (poll=%ds, DL=%.0f Mbps, UL=%.0f Mbps%s)",
+    _start_time = time.monotonic()
+
+    log.info("qbt_flow starting (poll=%ds, DL=%.0f Mbps, UL=%.0f Mbps, server=%s%s)",
              POLL_INTERVAL, TOTAL_BANDWIDTH_BPS / 1_000_000,
-             TOTAL_UPLOAD_BPS / 1_000_000,
+             TOTAL_UPLOAD_BPS / 1_000_000, MEDIA_SERVER_TYPE,
              ", dry-run" if DRY_RUN else "")
     if RACING_WINDOW_ENABLED:
         log.info("Racing window enabled: %02d:00–%02d:00, racing port=%d, "
@@ -431,22 +600,78 @@ def main():
                  RACING_NON_RACING_DL_LIMIT / (1024 * 1024),
                  RACING_NON_RACING_UL_LIMIT / (1024 * 1024))
 
+    _start_status_server()
+
+    prev_session_count = 0
+    ramp_remaining = 0
+    ramp_dl = 0
+    ramp_ul = 0
+    backoff = BackoffTracker(BACKOFF_MAX_INTERVAL)
+
     try:
         while not stop_event.is_set():
-            session_count, plex_bps = get_plex_sessions()
+            # Exponential backoff — skip poll while backing off
+            if backoff.should_skip():
+                log.debug("Media server backoff active, skipping check")
+                stop_event.wait(POLL_INTERVAL)
+                continue
+
+            session_count, server_bps = get_sessions()
 
             if session_count < 0:
+                delay = backoff.record_failure()
+                _status["label"] = "UNREACHABLE"
                 if PLEX_UNREACHABLE_ACTION == "keep":
-                    log.info("Plex unreachable — keeping last limits")
+                    log.info("Media server unreachable — keeping last limits (backoff %ds)", delay)
                 else:
-                    log.info("Plex unreachable — setting unlimited")
+                    log.info("Media server unreachable — setting unlimited (backoff %ds)", delay)
                     apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
-            elif session_count == 0:
-                apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
             else:
-                dl_bytes, ul_bytes, detail = calculate_limits(session_count, plex_bps)
-                log.debug("Plex poll: %s", detail)
-                apply_limits(dl_bytes, ul_bytes, "THROTTLE", detail)
+                backoff.record_success()
+                _status["streams"] = session_count
+
+                if session_count == 0:
+                    # Start ramp-up if transitioning from active streams
+                    if prev_session_count > 0 and RAMP_UP_STEPS > 0 and last_dl_limit:
+                        ramp_remaining = RAMP_UP_STEPS
+                        ramp_dl = last_dl_limit
+                        ramp_ul = last_ul_limit or 0
+
+                    if ramp_remaining > 0:
+                        ramp_remaining -= 1
+                        if ramp_remaining == 0:
+                            apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
+                        else:
+                            ramp_dl *= 2
+                            ramp_ul *= 2
+                            max_bw = int(TOTAL_BANDWIDTH_BPS / 8)
+                            if ramp_dl >= max_bw:
+                                apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
+                                ramp_remaining = 0
+                            else:
+                                step = RAMP_UP_STEPS - ramp_remaining
+                                apply_limits(ramp_dl, ramp_ul, "RAMP-UP",
+                                             f"step {step}/{RAMP_UP_STEPS}")
+                    else:
+                        apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
+                else:
+                    ramp_remaining = 0
+                    dl_bytes, ul_bytes, detail = calculate_limits(session_count, server_bps)
+                    log.debug("Media poll: %s", detail)
+                    apply_limits(dl_bytes, ul_bytes, "THROTTLE", detail)
+
+                prev_session_count = session_count
+
+            # Update status
+            _status["dl_limit"] = last_dl_limit or 0
+            _status["ul_limit"] = last_ul_limit or 0
+            _status["racing_active"] = _is_racing_window()
+            if ramp_remaining > 0:
+                _status["label"] = "RAMP-UP"
+            elif session_count > 0:
+                _status["label"] = "THROTTLE"
+            elif session_count == 0:
+                _status["label"] = "NORMAL"
 
             stop_event.wait(POLL_INTERVAL)
     finally:

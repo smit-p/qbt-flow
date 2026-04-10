@@ -4,6 +4,7 @@ test_qbt_flow.py
 Unit tests for qbt_flow.py — stdlib only (unittest + unittest.mock).
 """
 
+import json
 import os
 import sys
 import threading
@@ -833,7 +834,7 @@ class TestMain(unittest.TestCase):
         m.stop_event.clear()
 
     @patch("qbt_flow.apply_limits")
-    @patch("qbt_flow.get_plex_sessions", return_value=(0, 0))
+    @patch("qbt_flow.get_sessions", return_value=(0, 0))
     def test_main_loop_normal_no_streams(self, mock_plex, mock_apply):
         """One iteration: no streams → NORMAL limits."""
         m.PLEX_TOKEN    = "test-token"
@@ -850,7 +851,7 @@ class TestMain(unittest.TestCase):
         mock_apply.assert_called()
 
     @patch("qbt_flow.apply_limits")
-    @patch("qbt_flow.get_plex_sessions", return_value=(2, 50_000_000))
+    @patch("qbt_flow.get_sessions", return_value=(2, 50_000_000))
     def test_main_loop_throttle_with_streams(self, mock_plex, mock_apply):
         """One iteration: active streams → THROTTLE limits."""
         m.PLEX_TOKEN    = "test-token"
@@ -872,7 +873,7 @@ class TestMain(unittest.TestCase):
         self.assertTrue(any("THROTTLE" in str(c) for c in calls))
 
     @patch("qbt_flow.apply_limits")
-    @patch("qbt_flow.get_plex_sessions", return_value=(-1, 0))
+    @patch("qbt_flow.get_sessions", return_value=(-1, 0))
     def test_main_loop_plex_unreachable_keep(self, mock_plex, mock_apply):
         """Plex unreachable with keep action → no apply_limits call in loop."""
         m.PLEX_TOKEN    = "test-token"
@@ -893,7 +894,7 @@ class TestMain(unittest.TestCase):
             m.main()
 
     @patch("qbt_flow.apply_limits")
-    @patch("qbt_flow.get_plex_sessions", return_value=(-1, 0))
+    @patch("qbt_flow.get_sessions", return_value=(-1, 0))
     def test_main_loop_plex_unreachable_unlimited(self, mock_plex, mock_apply):
         """Plex unreachable with unlimited action → apply unlimited."""
         m.PLEX_TOKEN    = "test-token"
@@ -910,7 +911,7 @@ class TestMain(unittest.TestCase):
         mock_apply.assert_called()
 
     @patch("qbt_flow.apply_limits")
-    @patch("qbt_flow.get_plex_sessions", return_value=(0, 0))
+    @patch("qbt_flow.get_sessions", return_value=(0, 0))
     def test_main_non_dry_run_cleanup(self, mock_plex, mock_apply):
         """Non-dry-run shutdown calls apply_limits(0, 0, SHUTDOWN, force=True)."""
         m.PLEX_TOKEN    = "test-token"
@@ -925,7 +926,7 @@ class TestMain(unittest.TestCase):
         self.assertTrue(len(shutdown_calls) > 0)
 
     @patch("qbt_flow.apply_limits")
-    @patch("qbt_flow.get_plex_sessions", return_value=(0, 0))
+    @patch("qbt_flow.get_sessions", return_value=(0, 0))
     def test_main_racing_window_log(self, mock_plex, mock_apply):
         """Main logs racing window config when enabled."""
         m.PLEX_TOKEN    = "test-token"
@@ -973,6 +974,422 @@ class TestLoadEnv(unittest.TestCase):
     def test_load_env_no_file(self):
         with patch("pathlib.Path.exists", return_value=False):
             m._load_env()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# BackoffTracker
+# ---------------------------------------------------------------------------
+
+class TestBackoffTracker(unittest.TestCase):
+    def test_no_failures_skip_returns_false(self):
+        bt = m.BackoffTracker()
+        self.assertFalse(bt.should_skip())
+
+    def test_record_failure_increases_delay(self):
+        bt = m.BackoffTracker(max_interval=300)
+        d1 = bt.record_failure()
+        d2 = bt.record_failure()
+        self.assertEqual(d1, 2)
+        self.assertEqual(d2, 4)
+
+    def test_record_success_resets(self):
+        bt = m.BackoffTracker()
+        bt.record_failure()
+        bt.record_failure()
+        bt.record_success()
+        self.assertEqual(bt.failures, 0)
+        self.assertFalse(bt.should_skip())
+
+    def test_max_interval_cap(self):
+        bt = m.BackoffTracker(max_interval=10)
+        for _ in range(20):
+            bt.record_failure()
+        self.assertEqual(bt.current_delay(), 10)
+
+    def test_should_skip_during_backoff(self):
+        bt = m.BackoffTracker()
+        bt.record_failure()
+        # Just recorded a failure — should skip because _next_retry is in the future
+        self.assertTrue(bt.should_skip())
+
+    def test_current_delay_zero_when_no_failures(self):
+        bt = m.BackoffTracker()
+        self.assertEqual(bt.current_delay(), 0)
+
+
+# ---------------------------------------------------------------------------
+# Jellyfin / Emby sessions
+# ---------------------------------------------------------------------------
+
+class TestJellyfinEmbySessions(unittest.TestCase):
+    def test_jellyfin_active_session(self):
+        data = json.dumps([
+            {
+                "NowPlayingItem": {"Bitrate": 20_000_000},
+                "PlayState": {"IsPaused": False},
+            }
+        ]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 1)
+        self.assertEqual(bps, 20_000_000)
+
+    def test_jellyfin_paused_excluded(self):
+        data = json.dumps([
+            {
+                "NowPlayingItem": {"Bitrate": 20_000_000},
+                "PlayState": {"IsPaused": True},
+            }
+        ]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 0)
+        self.assertEqual(bps, 0)
+
+    def test_jellyfin_no_nowplayingitem_skipped(self):
+        data = json.dumps([{"Id": "abc"}]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 0)
+
+    def test_jellyfin_error_returns_minus_one(self):
+        with patch("qbt_flow.urlopen", side_effect=URLError("timeout")):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, -1)
+
+    def test_emby_uses_emby_path_prefix(self):
+        data = json.dumps([
+            {
+                "NowPlayingItem": {"Bitrate": 8_000_000},
+                "PlayState": {"IsPaused": False},
+            }
+        ]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp) as mock_url:
+            count, bps = m.get_emby_sessions()
+        self.assertEqual(count, 1)
+        self.assertEqual(bps, 8_000_000)
+        # Verify the URL contains /emby/Sessions
+        call_args = mock_url.call_args
+        req = call_args[0][0]
+        self.assertIn("/emby/Sessions", req.full_url)
+
+    def test_jellyfin_multiple_streams_summed(self):
+        data = json.dumps([
+            {"NowPlayingItem": {"Bitrate": 10_000_000}, "PlayState": {"IsPaused": False}},
+            {"NowPlayingItem": {"Bitrate": 15_000_000}, "PlayState": {"IsPaused": False}},
+        ]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 2)
+        self.assertEqual(bps, 25_000_000)
+
+    def test_jellyfin_missing_bitrate_defaults_to_zero(self):
+        data = json.dumps([
+            {"NowPlayingItem": {"Name": "Some Movie"}, "PlayState": {"IsPaused": False}},
+        ]).encode()
+        resp = _make_response(data)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 1)
+        self.assertEqual(bps, 0)
+
+    def test_jellyfin_malformed_json_returns_minus_one(self):
+        resp = _make_response(b"not json")
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, -1)
+
+
+# ---------------------------------------------------------------------------
+# get_sessions dispatcher
+# ---------------------------------------------------------------------------
+
+class TestGetSessions(unittest.TestCase):
+    def setUp(self):
+        self._orig = m.MEDIA_SERVER_TYPE
+
+    def tearDown(self):
+        m.MEDIA_SERVER_TYPE = self._orig
+
+    def test_dispatches_plex(self):
+        m.MEDIA_SERVER_TYPE = "plex"
+        with patch("qbt_flow.get_plex_sessions", return_value=(1, 100)) as mock:
+            result = m.get_sessions()
+        mock.assert_called_once()
+        self.assertEqual(result, (1, 100))
+
+    def test_dispatches_jellyfin(self):
+        m.MEDIA_SERVER_TYPE = "jellyfin"
+        with patch("qbt_flow.get_jellyfin_sessions", return_value=(2, 200)) as mock:
+            result = m.get_sessions()
+        mock.assert_called_once()
+        self.assertEqual(result, (2, 200))
+
+    def test_dispatches_emby(self):
+        m.MEDIA_SERVER_TYPE = "emby"
+        with patch("qbt_flow.get_emby_sessions", return_value=(3, 300)) as mock:
+            result = m.get_sessions()
+        mock.assert_called_once()
+        self.assertEqual(result, (3, 300))
+
+
+# ---------------------------------------------------------------------------
+# Status endpoint
+# ---------------------------------------------------------------------------
+
+class TestStatusEndpoint(unittest.TestCase):
+    def test_status_handler_json(self):
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/status"
+        handler.wfile = MagicMock()
+        m._StatusHandler.do_GET(handler)
+        handler.send_response.assert_called_with(200)
+        handler.send_header.assert_called_with("Content-Type", "application/json")
+
+    def test_status_handler_metrics(self):
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/metrics"
+        handler.wfile = MagicMock()
+        m._StatusHandler.do_GET(handler)
+        handler.send_response.assert_called_with(200)
+        handler.send_header.assert_called_with("Content-Type", "text/plain; version=0.0.4")
+
+    def test_status_handler_root(self):
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/"
+        handler.wfile = MagicMock()
+        m._StatusHandler.do_GET(handler)
+        handler.send_response.assert_called_with(200)
+
+    def test_status_handler_404(self):
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/unknown"
+        handler.wfile = MagicMock()
+        m._StatusHandler.do_GET(handler)
+        handler.send_response.assert_called_with(404)
+
+    def test_start_status_server_disabled(self):
+        orig = m.STATUS_PORT
+        m.STATUS_PORT = 0
+        result = m._start_status_server()
+        self.assertIsNone(result)
+        m.STATUS_PORT = orig
+
+    def test_log_message_suppressed(self):
+        handler = MagicMock(spec=m._StatusHandler)
+        m._StatusHandler.log_message(handler, "test %s", "arg")
+        # Should not raise — just suppresses output
+
+
+# ---------------------------------------------------------------------------
+# Ramp-up (integration via main loop)
+# ---------------------------------------------------------------------------
+
+class TestRampUp(unittest.TestCase):
+    def setUp(self):
+        self._orig_token = m.PLEX_TOKEN
+        self._orig_inst  = m.QBT_INSTANCES
+        self._orig_dry   = m.DRY_RUN
+        self._orig_ramp  = m.RAMP_UP_STEPS
+        self._orig_poll  = m.POLL_INTERVAL
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.POLL_INTERVAL = 0
+
+    def tearDown(self):
+        m.PLEX_TOKEN    = self._orig_token
+        m.QBT_INSTANCES = self._orig_inst
+        m.DRY_RUN       = self._orig_dry
+        m.RAMP_UP_STEPS = self._orig_ramp
+        m.POLL_INTERVAL = self._orig_poll
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.stop_event.clear()
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_ramp_up_starts_on_stream_drop(self, mock_sessions, mock_apply, _srv):
+        """Streams → no streams with RAMP_UP_STEPS=3 triggers ramp-up."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 3
+
+        # Cycle 1: 2 streams → throttle
+        # Cycle 2: 0 streams → start ramp (step 1/3)
+        # Cycle 3: 0 streams → ramp (step 2/3)
+        # Cycle 4: 0 streams → unlimited
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (2, 50_000_000)
+            return (0, 0)
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            # Set last_dl_limit to a throttled value on first call
+            if apply_count[0] == 1:
+                m.last_dl_limit = 50 * 1024 * 1024
+                m.last_ul_limit = 25 * 1024 * 1024
+            if apply_count[0] >= 5:  # enough iterations
+                m.stop_event.set()
+
+        mock_apply.side_effect = apply_side_effect
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        # Check that RAMP-UP label was used
+        labels = [c.args[2] for c in mock_apply.call_args_list]
+        self.assertIn("RAMP-UP", labels)
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_ramp_cancelled_by_new_stream(self, mock_sessions, mock_apply, _srv):
+        """New streams during ramp cancel the ramp."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 3
+
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (2, 50_000_000)  # streams active
+            if call_count[0] == 2:
+                return (0, 0)  # streams stop → ramp begins
+            if call_count[0] == 3:
+                return (1, 30_000_000)  # stream comes back → cancel ramp
+            return (0, 0)
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            if apply_count[0] == 1:
+                m.last_dl_limit = 50 * 1024 * 1024
+                m.last_ul_limit = 25 * 1024 * 1024
+            if apply_count[0] >= 5:
+                m.stop_event.set()
+
+        mock_apply.side_effect = apply_side_effect
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        labels = [c.args[2] for c in mock_apply.call_args_list]
+        self.assertIn("THROTTLE", labels)
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions", return_value=(0, 0))
+    def test_ramp_disabled_when_zero_steps(self, mock_sessions, mock_apply, _srv):
+        """RAMP_UP_STEPS=0 means instant unlimited."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 0
+        m.stop_event.set()
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        # Should NOT have any RAMP-UP labels
+        labels = [c.args[2] for c in mock_apply.call_args_list if len(c.args) > 2]
+        self.assertNotIn("RAMP-UP", labels)
+
+
+# ---------------------------------------------------------------------------
+# Main loop with backoff
+# ---------------------------------------------------------------------------
+
+class TestMainBackoff(unittest.TestCase):
+    def setUp(self):
+        self._orig_token = m.PLEX_TOKEN
+        self._orig_inst  = m.QBT_INSTANCES
+        self._orig_dry   = m.DRY_RUN
+        self._orig_ramp  = m.RAMP_UP_STEPS
+        self._orig_poll  = m.POLL_INTERVAL
+        m.POLL_INTERVAL = 0
+
+    def tearDown(self):
+        m.PLEX_TOKEN    = self._orig_token
+        m.QBT_INSTANCES = self._orig_inst
+        m.DRY_RUN       = self._orig_dry
+        m.RAMP_UP_STEPS = self._orig_ramp
+        m.POLL_INTERVAL = self._orig_poll
+        m.stop_event.clear()
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions", return_value=(-1, 0))
+    def test_backoff_increases_on_repeated_failures(self, mock_sessions, mock_apply, _srv):
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.PLEX_UNREACHABLE_ACTION = "keep"
+        m.RAMP_UP_STEPS = 0
+
+        call_count = [0]
+        original_wait = m.stop_event.wait
+        def wait_and_stop(timeout):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                m.stop_event.set()
+            return original_wait(0)
+
+        with patch.object(m.stop_event, "wait", side_effect=wait_and_stop), \
+             patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        # Should have been called (logging backoff)
+        self.assertTrue(mock_sessions.call_count >= 1)
+
+
+# ---------------------------------------------------------------------------
+# _validate_config — media server type
+# ---------------------------------------------------------------------------
+
+class TestValidateConfigMediaType(unittest.TestCase):
+    def setUp(self):
+        self._orig_token = m.PLEX_TOKEN
+        self._orig_inst  = m.QBT_INSTANCES
+        self._orig_type  = m.MEDIA_SERVER_TYPE
+
+    def tearDown(self):
+        m.PLEX_TOKEN        = self._orig_token
+        m.QBT_INSTANCES     = self._orig_inst
+        m.MEDIA_SERVER_TYPE = self._orig_type
+
+    def test_invalid_media_server_type_exits(self):
+        m.PLEX_TOKEN        = "valid"
+        m.QBT_INSTANCES     = [("h", 8080, "u", "p", "http")]
+        m.MEDIA_SERVER_TYPE = "invalid"
+        with self.assertRaises(SystemExit):
+            m._validate_config()
+
+    def test_jellyfin_type_accepted(self):
+        m.PLEX_TOKEN        = "valid"
+        m.QBT_INSTANCES     = [("h", 8080, "u", "p", "http")]
+        m.MEDIA_SERVER_TYPE = "jellyfin"
+        m._validate_config()  # must not raise
+
+    def test_emby_type_accepted(self):
+        m.PLEX_TOKEN        = "valid"
+        m.QBT_INSTANCES     = [("h", 8080, "u", "p", "http")]
+        m.MEDIA_SERVER_TYPE = "emby"
+        m._validate_config()  # must not raise
 
 
 if __name__ == "__main__":
