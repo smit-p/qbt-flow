@@ -74,10 +74,10 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `QBT_SPLIT_BETWEEN_INSTANCES` | `true` | Split bandwidth evenly across instances (set `false` to give each the full amount) |
 | `MIN_QBT_DL` | `10MB/s` | Minimum download limit — qbt is never throttled below this |
 | `MIN_QBT_UL` | `5MB/s` | Minimum upload limit |
-| `PLEX_OVERHEAD_FACTOR` | `1.25` | Multiplier on stream bitrates to account for buffering |
+| `STREAM_OVERHEAD_FACTOR` | `1.25` | Multiplier on stream bitrates to account for buffering |
 | `POLL_INTERVAL` | `15` | Seconds between media server session polls |
 | `REQUEST_TIMEOUT` | `10` | HTTP request timeout in seconds |
-| `PLEX_UNREACHABLE_ACTION` | `keep` | What to do when all media servers are down: `keep` (retain last limits) or `unlimited` |
+| `UNREACHABLE_ACTION` | `keep` | What to do when all media servers are down: `keep` (retain last limits) or `unlimited` |
 | `RAMP_UP_STEPS` | `3` | Cycles to ramp from throttled → unlimited when streams stop (0 = instant). Each step doubles the limit |
 | `BACKOFF_MAX_INTERVAL` | `300` | Max per-server exponential backoff (seconds) when a media server is unreachable |
 | `STATUS_PORT` | `0` (disabled) | Port for the status/metrics HTTP endpoint. Set to e.g. `9101` to enable |
@@ -154,8 +154,6 @@ JELLYFIN_TOKEN=your-jellyfin-api-key
 ```
 
 Each server has its own exponential backoff tracker — if one goes down, the others continue working. For Emby, the URL is typically `http://host:8920`; qbt-flow adds the `/emby/` prefix automatically.
-
-The legacy `MEDIA_SERVER_TYPE` + `MEDIA_SERVER_URL` + `MEDIA_SERVER_TOKEN` config still works for single-server setups and is mapped to the right `*_URL`/`*_TOKEN` pair automatically.
 
 ### Gradual ramp-up
 

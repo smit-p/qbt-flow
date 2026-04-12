@@ -207,9 +207,9 @@ fi
 # Sensible defaults
 add "# Tuning — see config.env.example for all options"
 add "POLL_INTERVAL=15"
-add "PLEX_OVERHEAD_FACTOR=1.25"
+add "STREAM_OVERHEAD_FACTOR=1.25"
 add "RAMP_UP_STEPS=3"
-add "PLEX_UNREACHABLE_ACTION=keep"
+add "UNREACHABLE_ACTION=keep"
 
 # ── Write config.env ────────────────────────────────────────────────────────
 sep

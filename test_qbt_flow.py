@@ -182,7 +182,7 @@ class TestCalculateLimits(unittest.TestCase):
         m.TOTAL_UPLOAD_BPS      = 1_000_000_000   # same upload by default
         m.QBT_HEADROOM_FRACTION = 0.8
         m.QBT_UPLOAD_FRACTION   = 0.9
-        m.PLEX_OVERHEAD_FACTOR  = 1.25
+        m.STREAM_OVERHEAD_FACTOR  = 1.25
         m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024   # 10 MB/s
         m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024   #  5 MB/s
 
@@ -973,7 +973,7 @@ class TestMain(unittest.TestCase):
         """Plex unreachable with keep action → no apply_limits call in loop."""
         m.PLEX_TOKEN    = "test-token"
         m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
-        m.PLEX_UNREACHABLE_ACTION = "keep"
+        m.UNREACHABLE_ACTION = "keep"
 
         # Run one iteration then stop
         original_wait = m.stop_event.wait
@@ -994,7 +994,7 @@ class TestMain(unittest.TestCase):
         """Plex unreachable with unlimited action → apply unlimited."""
         m.PLEX_TOKEN    = "test-token"
         m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
-        m.PLEX_UNREACHABLE_ACTION = "unlimited"
+        m.UNREACHABLE_ACTION = "unlimited"
 
         def stop_after_first(*args, **kwargs):
             m.stop_event.set()
@@ -1598,7 +1598,7 @@ class TestMainBackoff(unittest.TestCase):
     def test_unreachable_keep_no_apply(self, mock_sessions, mock_apply, _srv):
         """When all servers unreachable with 'keep', apply_limits is not called."""
         m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
-        m.PLEX_UNREACHABLE_ACTION = "keep"
+        m.UNREACHABLE_ACTION = "keep"
         m.RAMP_UP_STEPS = 0
 
         call_count = [0]

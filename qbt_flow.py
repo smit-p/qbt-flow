@@ -124,19 +124,6 @@ JELLYFIN_TOKEN = _env("JELLYFIN_TOKEN", "")
 EMBY_URL       = _env("EMBY_URL", "")
 EMBY_TOKEN     = _env("EMBY_TOKEN", "")
 
-# Legacy compat: MEDIA_SERVER_TYPE + MEDIA_SERVER_URL + MEDIA_SERVER_TOKEN
-_ms_type  = _env("MEDIA_SERVER_TYPE", "").lower()
-_ms_url   = _env("MEDIA_SERVER_URL", "")
-_ms_token = _env("MEDIA_SERVER_TOKEN", "")
-if _ms_url and _ms_token:
-    _target = _ms_type or "plex"
-    if _target == "plex" and not PLEX_TOKEN:
-        PLEX_URL, PLEX_TOKEN = _ms_url, _ms_token
-    elif _target == "jellyfin" and not JELLYFIN_TOKEN:
-        JELLYFIN_URL, JELLYFIN_TOKEN = _ms_url, _ms_token
-    elif _target == "emby" and not EMBY_TOKEN:
-        EMBY_URL, EMBY_TOKEN = _ms_url, _ms_token
-
 # Default Plex URL when nothing else is configured
 if not PLEX_URL and not JELLYFIN_URL and not EMBY_URL:
     PLEX_URL = "http://localhost:32400"
@@ -190,14 +177,14 @@ MIN_QBT_UL_BYTES = int(_env_speed("MIN_QBT_UL",  5 * 1024 * 1024))   #  5 MB/s
 NORMAL_DL_BYTES = 0  # unlimited
 NORMAL_UL_BYTES = 0  # unlimited
 
-# Safety buffer added on top of reported Plex bitrate
-PLEX_OVERHEAD_FACTOR = _env_float("PLEX_OVERHEAD_FACTOR", 1.25)
+# Safety buffer added on top of reported stream bitrates
+STREAM_OVERHEAD_FACTOR = _env_float("STREAM_OVERHEAD_FACTOR", 1.25)
 
 POLL_INTERVAL   = _env_int("POLL_INTERVAL",   15)   # seconds between checks
 REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 10)
 
 # Behavior when media server is unreachable: "unlimited" or "keep" (last limits)
-PLEX_UNREACHABLE_ACTION = _env("PLEX_UNREACHABLE_ACTION", "keep")
+UNREACHABLE_ACTION = _env("UNREACHABLE_ACTION", "keep")
 
 # Gradual ramp-up when streams stop: number of cycles (including final
 # unlimited) before removing all limits.  0 = instant.  Each step doubles.
@@ -334,6 +321,8 @@ def get_plex_sessions(url=None, token=None):
             player = session.find("Player")
             state = player.attrib.get("state", "playing") if player is not None else session.attrib.get("state", "playing")
             if state in ("paused", "stopped"):
+                title = session.attrib.get("title", "unknown")
+                log.debug("Plex: skipping %s session '%s'", state, title)
                 continue
             count += 1
             # Plex reports bitrate in kbps on the Session element.
@@ -345,7 +334,10 @@ def get_plex_sessions(url=None, token=None):
                     bitrate = media.attrib.get("bitrate")
             if bitrate:
                 total_kbps += int(bitrate)
+            title = session.attrib.get("title", "unknown")
+            log.debug("Plex: active stream '%s' @ %s kbps", title, bitrate or "unknown")
         total_bps = total_kbps * 1000
+        log.debug("Plex: %d active stream(s), total %d kbps", count, total_kbps)
         return count, total_bps
     except (URLError, HTTPError, ET.ParseError, ValueError) as e:
         log.warning("Plex session check failed: %s", e)
@@ -390,6 +382,9 @@ def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix=""):
                     if bitrate:
                         break
             total_bps += bitrate
+            item_name = now_playing.get("Name", "unknown")
+            log.debug("Media server: active stream '%s' @ %.1f Mbps", item_name, bitrate / 1_000_000)
+        log.debug("Media server: %d active stream(s), total %.1f Mbps", count, total_bps / 1_000_000)
         return count, total_bps
     except (URLError, HTTPError, json.JSONDecodeError, ValueError, KeyError) as e:
         log.warning("Media server session check failed: %s", e)
@@ -444,9 +439,12 @@ def get_sessions():
             total_count += count
             total_bps += bps
             any_ok = True
+            log.debug("%s: %d stream(s), %.1f Mbps", name, count, bps / 1_000_000)
 
     if not any_ok:
+        log.debug("All media servers unreachable")
         return -1, 0
+    log.debug("Aggregated: %d stream(s), %.1f Mbps total", total_count, total_bps / 1_000_000)
     return total_count, total_bps
 
 
@@ -491,6 +489,7 @@ class QbtClient:
                     part = part.strip()
                     if part.startswith("SID="):
                         self.cookie = part
+                        log.debug("qbt login successful at %s", self.base)
                         return True
             log.warning("qbt login at %s: no SID in response", self.base)
             return False
@@ -602,16 +601,16 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
 # Limit calculation
 # ---------------------------------------------------------------------------
 
-def calculate_limits(session_count, plex_bps):
+def calculate_limits(session_count, stream_bps):
     """
-    Given active Plex session count and their total reported bitrate,
+    Given active stream count and their total reported bitrate,
     return (dl_bytes_per_sec, ul_bytes_per_sec) for qBittorrent.
     """
     # Apply overhead factor to account for burst buffering etc.
-    plex_reserved_bps = plex_bps * PLEX_OVERHEAD_FACTOR
+    reserved_bps = stream_bps * STREAM_OVERHEAD_FACTOR
 
-    remaining_dl_bps = max(0, TOTAL_BANDWIDTH_BPS - plex_reserved_bps)
-    remaining_ul_bps = max(0, TOTAL_UPLOAD_BPS - plex_reserved_bps)
+    remaining_dl_bps = max(0, TOTAL_BANDWIDTH_BPS - reserved_bps)
+    remaining_ul_bps = max(0, TOTAL_UPLOAD_BPS - reserved_bps)
 
     dl_bps = remaining_dl_bps * QBT_HEADROOM_FRACTION
     ul_bps = remaining_ul_bps * QBT_UPLOAD_FRACTION
@@ -620,9 +619,15 @@ def calculate_limits(session_count, plex_bps):
     dl_bytes = max(int(dl_bps / 8), MIN_QBT_DL_BYTES)
     ul_bytes = max(int(ul_bps / 8), MIN_QBT_UL_BYTES)
 
-    plex_mbps = plex_bps / 1_000_000
+    log.debug("Calc: streams=%.1f Mbps, reserved=%.1f Mbps (x%.2f), "
+              "remaining DL=%.1f/UL=%.1f Mbps, result DL=%s UL=%s",
+              stream_bps / 1_000_000, reserved_bps / 1_000_000,
+              STREAM_OVERHEAD_FACTOR, remaining_dl_bps / 1_000_000,
+              remaining_ul_bps / 1_000_000, _fmt_speed(dl_bytes), _fmt_speed(ul_bytes))
+
+    stream_mbps = stream_bps / 1_000_000
     detail = (f"{session_count} stream(s), "
-              f"using ~{plex_mbps:.0f} Mbps, "
+              f"using ~{stream_mbps:.0f} Mbps, "
               f"remaining DL {remaining_dl_bps / 1_000_000:.0f} Mbps / UL {remaining_ul_bps / 1_000_000:.0f} Mbps")
 
     return dl_bytes, ul_bytes, detail
@@ -710,6 +715,13 @@ def main():
              POLL_INTERVAL, TOTAL_BANDWIDTH_BPS / 1_000_000,
              TOTAL_UPLOAD_BPS / 1_000_000, server_names,
              ", dry-run" if DRY_RUN else "")
+    log.debug("Config: headroom_fraction=%.2f, upload_fraction=%.2f, "
+              "overhead_factor=%.2f, min_dl=%s, min_ul=%s, "
+              "unreachable_action=%s, ramp_steps=%d, split=%s, instances=%d",
+              QBT_HEADROOM_FRACTION, QBT_UPLOAD_FRACTION,
+              STREAM_OVERHEAD_FACTOR, _fmt_speed(MIN_QBT_DL_BYTES),
+              _fmt_speed(MIN_QBT_UL_BYTES), UNREACHABLE_ACTION,
+              RAMP_UP_STEPS, QBT_SPLIT_BETWEEN_INSTANCES, len(clients))
     if RACING_WINDOW_ENABLED:
         log.info("Racing window enabled: %02d:00–%02d:00, racing port=%d, "
                  "media cap DL=%.1f MB/s UL=%.1f MB/s",
@@ -730,7 +742,7 @@ def main():
 
             if session_count < 0:
                 _status["label"] = "UNREACHABLE"
-                if PLEX_UNREACHABLE_ACTION != "keep":
+                if UNREACHABLE_ACTION != "keep":
                     apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
             else:
                 _status["streams"] = session_count
@@ -741,6 +753,7 @@ def main():
                         ramp_remaining = RAMP_UP_STEPS
                         ramp_dl = last_dl_limit
                         ramp_ul = last_ul_limit or 0
+                        log.debug("Streams stopped, starting ramp-up (%d steps)", RAMP_UP_STEPS)
 
                     if ramp_remaining > 0:
                         ramp_remaining -= 1
@@ -760,9 +773,10 @@ def main():
                     else:
                         apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
                 else:
+                    if prev_session_count == 0:
+                        log.info("Stream(s) detected, entering throttle mode")
                     ramp_remaining = 0
                     dl_bytes, ul_bytes, detail = calculate_limits(session_count, server_bps)
-                    log.debug("Media poll: %s", detail)
                     apply_limits(dl_bytes, ul_bytes, "THROTTLE", detail)
 
                 prev_session_count = session_count
