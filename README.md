@@ -230,6 +230,22 @@ Logs are written to `throttle.log` in the script directory (configurable via `LO
 2026-01-15 02:00:01 INFO [RACING] Racing window active (00:00–07:00) — media instance capped
 ```
 
+## Update
+
+One-liner (works from anywhere):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/smit-p/qbt-flow/main/update.sh | bash
+```
+
+Or from the install directory:
+
+```bash
+./update.sh
+```
+
+This pulls the latest code and restarts the systemd service automatically. Your `config.env` is never touched.
+
 ## Dry-run mode
 
 Test your configuration without touching qBittorrent:
