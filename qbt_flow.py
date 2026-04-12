@@ -210,8 +210,10 @@ RACING_INSTANCE_PORT  = _env_int("RACING_INSTANCE_PORT", 39001)
 RACING_NON_RACING_DL_LIMIT = int(_env_speed("RACING_NON_RACING_DL_LIMIT", 1 * 1024 * 1024))   # 1 MB/s
 RACING_NON_RACING_UL_LIMIT = int(_env_speed("RACING_NON_RACING_UL_LIMIT", 1 * 1024 * 1024))   # 1 MB/s
 
-LOG_FILE  = _env("LOG_FILE", str(_SCRIPT_DIR / "throttle.log"))
-LOG_LEVEL = getattr(logging, _env("LOG_LEVEL", "INFO").upper(), logging.INFO)
+LOG_FILE       = _env("LOG_FILE", str(_SCRIPT_DIR / "throttle.log"))
+LOG_LEVEL      = getattr(logging, _env("LOG_LEVEL", "INFO").upper(), logging.INFO)
+LOG_MAX_SIZE   = int(_env_speed("LOG_MAX_SIZE", 5 * 1024 * 1024))   # 5 MB default
+LOG_BACKUP_COUNT = _env_int("LOG_BACKUP_COUNT", 3)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -222,7 +224,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.handlers.RotatingFileHandler(
-            LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
+            LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=LOG_BACKUP_COUNT
         ),
         logging.StreamHandler(sys.stdout),
     ],

@@ -83,6 +83,8 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `STATUS_PORT` | `0` (disabled) | Port for the status/metrics HTTP endpoint. Set to e.g. `9101` to enable |
 | `LOG_FILE` | `throttle.log` (in script dir) | Log file path |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_MAX_SIZE` | `5MB/s` | Max size per log file before rotation |
+| `LOG_BACKUP_COUNT` | `3` | Number of rotated log files to keep |
 | `RACING_WINDOW_ENABLED` | `false` | Enable the racing window feature |
 | `RACING_WINDOW_START` | `0` | Racing window start hour (24h, inclusive) |
 | `RACING_WINDOW_END` | `7` | Racing window end hour (24h, exclusive) |
@@ -215,7 +217,7 @@ journalctl -u qbt-flow -f
 
 ## Logging
 
-Logs are written to `throttle.log` in the script directory (configurable via `LOG_FILE`). Logs are automatically rotated at 5 MB with 3 backups kept. Set `LOG_LEVEL=DEBUG` for verbose output. Sample output:
+Logs are written to `throttle.log` in the script directory (configurable via `LOG_FILE`). Logs are automatically rotated — configure size and count with `LOG_MAX_SIZE` (default 5 MB) and `LOG_BACKUP_COUNT` (default 3). Set `LOG_LEVEL=DEBUG` for verbose output. Sample output:
 
 ```
 2026-01-15 14:23:01 INFO qbt_flow starting (poll=5s, DL=1000 Mbps, UL=1000 Mbps, servers=plex+jellyfin)
