@@ -340,14 +340,14 @@ def get_plex_sessions(url=None, token=None):
         log.debug("Plex: %d active stream(s), total %d kbps", count, total_kbps)
         return count, total_bps
     except (URLError, HTTPError, ET.ParseError, ValueError) as e:
-        log.warning("Plex session check failed: %s", e)
+        log.warning("Plex session check failed (%s): %s", url, e)
         return -1, 0
 
 # ---------------------------------------------------------------------------
 # Jellyfin / Emby helpers
 # ---------------------------------------------------------------------------
 
-def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix=""):
+def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix="", server_type="media"):
     """
     Shared Jellyfin / Emby session fetcher.
     Returns (session_count, total_bitrate_bps).  (-1, 0) on error.
@@ -370,6 +370,8 @@ def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix=""):
                 continue
             play_state = session.get("PlayState", {})
             if play_state.get("IsPaused", False):
+                item_name = now_playing.get("Name", "unknown")
+                log.debug("%s: skipping paused session '%s'", server_type, item_name)
                 continue
             count += 1
             # Bitrate may be on NowPlayingItem, TranscodingInfo, or MediaSources
@@ -383,22 +385,22 @@ def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix=""):
                         break
             total_bps += bitrate
             item_name = now_playing.get("Name", "unknown")
-            log.debug("Media server: active stream '%s' @ %.1f Mbps", item_name, bitrate / 1_000_000)
-        log.debug("Media server: %d active stream(s), total %.1f Mbps", count, total_bps / 1_000_000)
+            log.debug("%s: active stream '%s' @ %.1f Mbps", server_type, item_name, bitrate / 1_000_000)
+        log.debug("%s: %d active stream(s), total %.1f Mbps", server_type, count, total_bps / 1_000_000)
         return count, total_bps
     except (URLError, HTTPError, json.JSONDecodeError, ValueError, KeyError) as e:
-        log.warning("Media server session check failed: %s", e)
+        log.warning("%s session check failed (%s): %s", server_type, url, e)
         return -1, 0
 
 
 def get_jellyfin_sessions(url=None, token=None):
     """Jellyfin session fetcher."""
-    return _get_jellyfin_emby_sessions(url, token)
+    return _get_jellyfin_emby_sessions(url, token, server_type="Jellyfin")
 
 
 def get_emby_sessions(url=None, token=None):
     """Emby session fetcher."""
-    return _get_jellyfin_emby_sessions(url, token, "/emby")
+    return _get_jellyfin_emby_sessions(url, token, "/emby", server_type="Emby")
 
 
 # ---------------------------------------------------------------------------
@@ -432,9 +434,15 @@ def get_sessions():
 
         count, bps = fetch_fn(url, token)
         if count < 0:
+            was_ok = bt.failures == 0
             delay = bt.record_failure()
-            log.info("%s unreachable (backoff %ds)", name, delay)
+            if was_ok:
+                log.warning("%s became unreachable, backing off %ds", name, delay)
+            else:
+                log.info("%s still unreachable (attempt #%d, backoff %ds)", name, bt.failures, delay)
         else:
+            if bt.failures > 0:
+                log.info("%s recovered after %d failed attempt(s)", name, bt.failures)
             bt.record_success()
             total_count += count
             total_bps += bps
@@ -442,7 +450,7 @@ def get_sessions():
             log.debug("%s: %d stream(s), %.1f Mbps", name, count, bps / 1_000_000)
 
     if not any_ok:
-        log.debug("All media servers unreachable")
+        log.warning("All media servers unreachable")
         return -1, 0
     log.debug("Aggregated: %d stream(s), %.1f Mbps total", total_count, total_bps / 1_000_000)
     return total_count, total_bps
@@ -472,7 +480,7 @@ class QbtClient:
             with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
                 return resp.status == 200
         except (URLError, HTTPError) as e:
-            log.warning("qbt POST %s failed: %s", path, e)
+            log.warning("qbt %s POST %s failed: %s", self.base, path, e)
             return False
 
     def login(self):
@@ -502,11 +510,17 @@ class QbtClient:
         ok2 = self._post("/api/v2/transfer/setUploadLimit", {"limit": ul_bytes})
         if not (ok1 and ok2) and self.cookie:
             # Auth may have expired — re-login and retry once
-            log.debug("Retrying after re-login on %s", self.base)
+            log.info("qbt %s: auth expired, re-authenticating", self.base)
             self.cookie = None
             if self.login():
                 ok1 = self._post("/api/v2/transfer/setDownloadLimit", {"limit": dl_bytes})
                 ok2 = self._post("/api/v2/transfer/setUploadLimit", {"limit": ul_bytes})
+                if ok1 and ok2:
+                    log.info("qbt %s: retry succeeded after re-login", self.base)
+                else:
+                    log.warning("qbt %s: retry failed after re-login", self.base)
+            else:
+                log.error("qbt %s: re-login failed, giving up for this cycle", self.base)
         return ok1 and ok2
 
     def ensure_logged_in(self):
@@ -535,6 +549,13 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
 
     racing_active = _is_racing_window()
 
+    # Log racing window transitions
+    if last_racing_active is not None and racing_active != last_racing_active:
+        if racing_active:
+            log.info("Entering racing window (port %d gets priority)", RACING_INSTANCE_PORT)
+        else:
+            log.info("Exiting racing window, resuming normal split")
+
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
     # But always re-apply when label/detail changes (e.g. stream count).
     if not force and last_dl_limit is not None and last_ul_limit is not None:
@@ -542,7 +563,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
         ul_diff = abs(ul_bytes - last_ul_limit) / max(last_ul_limit, 1)
         detail_changed = detail != last_detail
         if dl_diff < 0.01 and ul_diff < 0.01 and racing_active == last_racing_active and not detail_changed:
-            log.debug("Limits unchanged within tolerance, skipping API call")
+            log.debug("Limits unchanged (dl±%.1f%% ul±%.1f%%), skipping", dl_diff * 100, ul_diff * 100)
             return
 
     # Compute per-instance limits
@@ -581,7 +602,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
                      f" ({detail})" if detail else "")
             continue
         if not client.ensure_logged_in():
-            log.error("Cannot login to qbt at %s — skipping", client.base)
+            log.error("qbt %s: login failed, skipping this cycle", client.base)
             continue
         ok = client.set_speed_limits(c_dl, c_ul)
         if ok:
@@ -590,7 +611,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
                      f" ({detail})" if detail else "")
         else:
             client.cookie = None
-            log.warning("Failed to set limits on %s, will retry next cycle", client.base)
+            log.error("qbt %s: failed to set limits, will retry next cycle", client.base)
 
     last_dl_limit = dl_bytes
     last_ul_limit = ul_bytes
@@ -687,13 +708,20 @@ def _start_status_server():
 def _validate_config():
     errors = []
     if not _configured_servers:
-        errors.append("No media server configured \u2014 set PLEX_URL+PLEX_TOKEN, "
+        errors.append("No media server configured — set PLEX_URL+PLEX_TOKEN, "
                       "JELLYFIN_URL+JELLYFIN_TOKEN, or EMBY_URL+EMBY_TOKEN")
     if not QBT_INSTANCES:
         errors.append("No valid QBT_INSTANCES configured")
+    if UNREACHABLE_ACTION not in ("keep", "unlimited"):
+        errors.append(f"Invalid UNREACHABLE_ACTION={UNREACHABLE_ACTION!r} "
+                      f"(must be 'keep' or 'unlimited')")
+    if QBT_HEADROOM_FRACTION < 0 or QBT_HEADROOM_FRACTION > 1:
+        errors.append(f"QBT_HEADROOM_FRACTION={QBT_HEADROOM_FRACTION} out of range [0, 1]")
+    if QBT_UPLOAD_FRACTION < 0 or QBT_UPLOAD_FRACTION > 1:
+        errors.append(f"QBT_UPLOAD_FRACTION={QBT_UPLOAD_FRACTION} out of range [0, 1]")
     if errors:
         for e in errors:
-            log.error(e)
+            log.error("Config error: %s", e)
         sys.exit(1)
 
 
@@ -711,17 +739,20 @@ def main():
     _start_time = time.monotonic()
 
     server_names = "+".join(name for name, _, _, _ in _configured_servers)
-    log.info("qbt_flow starting (poll=%ds, DL=%.0f Mbps, UL=%.0f Mbps, servers=%s%s)",
-             POLL_INTERVAL, TOTAL_BANDWIDTH_BPS / 1_000_000,
-             TOTAL_UPLOAD_BPS / 1_000_000, server_names,
-             ", dry-run" if DRY_RUN else "")
-    log.debug("Config: headroom_fraction=%.2f, upload_fraction=%.2f, "
-              "overhead_factor=%.2f, min_dl=%s, min_ul=%s, "
-              "unreachable_action=%s, ramp_steps=%d, split=%s, instances=%d",
-              QBT_HEADROOM_FRACTION, QBT_UPLOAD_FRACTION,
-              STREAM_OVERHEAD_FACTOR, _fmt_speed(MIN_QBT_DL_BYTES),
-              _fmt_speed(MIN_QBT_UL_BYTES), UNREACHABLE_ACTION,
-              RAMP_UP_STEPS, QBT_SPLIT_BETWEEN_INSTANCES, len(clients))
+    instance_list = ", ".join(f"{s}://{h}:{p}" for h, p, _, _, s in QBT_INSTANCES)
+    log.info("qbt-flow starting%s", " (DRY-RUN)" if DRY_RUN else "")
+    log.info("  Media servers : %s", server_names)
+    log.info("  qBt instances : %s", instance_list)
+    log.info("  Line speed    : DL %.0f Mbps / UL %.0f Mbps",
+             TOTAL_BANDWIDTH_BPS / 1_000_000, TOTAL_UPLOAD_BPS / 1_000_000)
+    log.info("  Poll interval : %ds", POLL_INTERVAL)
+    log.info("  DL fraction=%.2f  UL fraction=%.2f  overhead=%.2fx  "
+             "min DL=%s  min UL=%s",
+             QBT_HEADROOM_FRACTION, QBT_UPLOAD_FRACTION,
+             STREAM_OVERHEAD_FACTOR, _fmt_speed(MIN_QBT_DL_BYTES),
+             _fmt_speed(MIN_QBT_UL_BYTES))
+    log.info("  Unreachable=%s  ramp_steps=%d  split=%s",
+             UNREACHABLE_ACTION, RAMP_UP_STEPS, QBT_SPLIT_BETWEEN_INSTANCES)
     if RACING_WINDOW_ENABLED:
         log.info("Racing window enabled: %02d:00–%02d:00, racing port=%d, "
                  "media cap DL=%.1f MB/s UL=%.1f MB/s",
@@ -741,10 +772,14 @@ def main():
             session_count, server_bps = get_sessions()
 
             if session_count < 0:
+                if _status["label"] != "UNREACHABLE":
+                    log.warning("Entering UNREACHABLE state (action=%s)", UNREACHABLE_ACTION)
                 _status["label"] = "UNREACHABLE"
                 if UNREACHABLE_ACTION != "keep":
                     apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
             else:
+                if _status["label"] == "UNREACHABLE":
+                    log.info("Media server(s) reachable again")
                 _status["streams"] = session_count
 
                 if session_count == 0:
@@ -753,17 +788,19 @@ def main():
                         ramp_remaining = RAMP_UP_STEPS
                         ramp_dl = last_dl_limit
                         ramp_ul = last_ul_limit or 0
-                        log.debug("Streams stopped, starting ramp-up (%d steps)", RAMP_UP_STEPS)
+                        log.info("All streams stopped, ramping up over %d steps", RAMP_UP_STEPS)
 
                     if ramp_remaining > 0:
                         ramp_remaining -= 1
                         if ramp_remaining == 0:
+                            log.info("Ramp-up complete, removing limits")
                             apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
                         else:
                             ramp_dl *= 2
                             ramp_ul *= 2
                             max_bw = int(TOTAL_BANDWIDTH_BPS / 8)
                             if ramp_dl >= max_bw:
+                                log.info("Ramp-up reached line speed, removing limits")
                                 apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
                                 ramp_remaining = 0
                             else:
@@ -774,7 +811,9 @@ def main():
                         apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
                 else:
                     if prev_session_count == 0:
-                        log.info("Stream(s) detected, entering throttle mode")
+                        log.info("%d stream(s) detected, entering throttle mode", session_count)
+                    elif session_count != prev_session_count:
+                        log.info("Stream count changed: %d → %d", prev_session_count, session_count)
                     ramp_remaining = 0
                     dl_bytes, ul_bytes, detail = calculate_limits(session_count, server_bps)
                     apply_limits(dl_bytes, ul_bytes, "THROTTLE", detail)
