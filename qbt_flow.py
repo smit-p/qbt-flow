@@ -170,8 +170,11 @@ TOTAL_BANDWIDTH_BPS   = _env_speed("TOTAL_BANDWIDTH", 1_000_000_000)  # 1 Gbps
 # Upload line speed — defaults to TOTAL_BANDWIDTH if not set
 TOTAL_UPLOAD_BPS      = _env_speed("TOTAL_UPLOAD", TOTAL_BANDWIDTH_BPS)
 
-# Fraction of remaining bandwidth (after Plex) to give qBittorrent.
-QBT_HEADROOM_FRACTION = _env_float("QBT_HEADROOM_FRACTION", 0.8)
+# Fraction of remaining bandwidth (after media streams) to give qBittorrent.
+# Download defaults to 1.0 (no throttling) because media streams use upload,
+# not download.  Lower this only if you have a specific reason (e.g. bufferbloat
+# without router-level QoS).
+QBT_HEADROOM_FRACTION = _env_float("QBT_HEADROOM_FRACTION", 1.0)
 QBT_UPLOAD_FRACTION   = _env_float("QBT_UPLOAD_FRACTION",   0.9)
 
 # Whether to split bandwidth evenly across qBittorrent instances.

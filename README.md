@@ -1,8 +1,8 @@
 # qbt-flow
 
-Automatic bandwidth manager for qBittorrent that prevents media-server buffering without sacrificing download speed.
+Automatic upload bandwidth manager for qBittorrent that prevents media-server buffering without sacrificing download speed.
 
-qbt-flow watches your Plex, Jellyfin, or Emby server for active streams and dynamically adjusts qBittorrent's speed limits based on real-time bandwidth usage. When someone starts watching, qBittorrent is throttled just enough to guarantee smooth playback. When playback stops, limits ramp back up gradually and qBittorrent returns to full speed — no manual intervention needed.
+qbt-flow watches your Plex, Jellyfin, or Emby server for active streams and dynamically adjusts qBittorrent's upload speed limit based on real-time bandwidth usage. Media streams consume your server's upload bandwidth (server → remote viewer), so qbt-flow throttles upload to guarantee smooth playback. When playback stops, limits ramp back up gradually and qBittorrent returns to full speed — no manual intervention needed. Download throttling is available but disabled by default since it doesn't compete with outbound streams.
 
 Optionally supports multiple qBittorrent instances and a racing window where one instance gets priority bandwidth during configurable hours.
 
@@ -10,8 +10,8 @@ Optionally supports multiple qBittorrent instances and a racing window where one
 
 1. Every N seconds (default: 15), the script polls your media server for active sessions.
 2. It sums the actual stream bitrates (not just media bitrate — real transcoded/direct-play bandwidth).
-3. It subtracts that usage (plus a headroom multiplier) from your total line speed.
-4. The remaining bandwidth is divided between download and upload. If multiple qBittorrent instances are configured, the limit is split evenly between them (configurable), then pushed to each instance via the Web API.
+3. It subtracts that usage (plus a headroom multiplier) from your total upload speed. Media streams consume upload bandwidth (server → viewer), so by default only upload is throttled. Download throttling is available but disabled by default.
+4. The remaining bandwidth is allocated to qBittorrent. If multiple instances are configured, the limit is split evenly between them (configurable), then pushed to each instance via the Web API.
 5. If no streams are active, limits are gradually ramped up (configurable steps) before going unlimited.
 6. **Racing window**: during configurable hours, the racing instance gets priority bandwidth while all other instances are hard-capped — regardless of stream activity.
 7. **Exponential backoff**: when the media server is unreachable, retries back off exponentially (2s → 4s → 8s … up to a configurable max) to reduce log noise and unnecessary requests.
@@ -69,8 +69,8 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `QBT_INSTANCES` | *(none — required)* | Comma-separated list of qBittorrent instances: `host:port:user:pass[:scheme]` |
 | `TOTAL_BANDWIDTH` | `1Gbps` | Your download line speed. Accepts suffixes: `Mbps`, `Gbps` (bits/sec) or `MB/s`, `GB/s` (bytes/sec). Plain numbers = bits/sec |
 | `TOTAL_UPLOAD` | *(same as download)* | Your upload line speed — set for asymmetric connections |
-| `QBT_HEADROOM_FRACTION` | `0.8` | Fraction of remaining bandwidth to give qbt (download) |
-| `QBT_UPLOAD_FRACTION` | `0.9` | Fraction of remaining bandwidth to give qbt (upload) |
+| `QBT_HEADROOM_FRACTION` | `1.0` | Fraction of remaining bandwidth to give qbt (download). Defaults to 1.0 (no throttling) since media streams use upload, not download |
+| `QBT_UPLOAD_FRACTION` | `0.9` | Fraction of remaining upload bandwidth to give qbt — this is the key setting for protecting streams |
 | `QBT_SPLIT_BETWEEN_INSTANCES` | `true` | Split bandwidth evenly across instances (set `false` to give each the full amount) |
 | `MIN_QBT_DL` | `10MB/s` | Minimum download limit — qbt is never throttled below this |
 | `MIN_QBT_UL` | `5MB/s` | Minimum upload limit |
@@ -117,10 +117,11 @@ Upload limits will then be calculated against the upload total separately.
 
 ### Bandwidth example
 
-If `TOTAL_BANDWIDTH=1Gbps` and your media server is streaming a 20 Mbps 4K file:
+If `TOTAL_UPLOAD=50Mbps` and your media server is streaming a 20 Mbps 4K file:
 - Stream usage = 20 Mbps × 1.25 overhead = 25 Mbps
-- Remaining = 975 Mbps
-- qbt download limit = 975 × 0.8 = 780 Mbps = ~97.5 MB/s
+- Remaining upload = 25 Mbps
+- qbt upload limit = 25 × 0.9 = 22.5 Mbps = ~2.8 MB/s
+- qbt download is left unlimited (streams don't use download bandwidth)
 
 ### Racing window
 
