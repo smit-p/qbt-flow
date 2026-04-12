@@ -83,7 +83,7 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `STATUS_PORT` | `0` (disabled) | Port for the status/metrics HTTP endpoint. Set to e.g. `9101` to enable |
 | `LOG_FILE` | `throttle.log` (in script dir) | Log file path |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `LOG_MAX_SIZE` | `5MB/s` | Max size per log file before rotation |
+| `LOG_MAX_SIZE` | `5MB` | Max size per log file before rotation |
 | `LOG_BACKUP_COUNT` | `3` | Number of rotated log files to keep |
 | `RACING_WINDOW_ENABLED` | `false` | Enable the racing window feature |
 | `RACING_WINDOW_START` | `0` | Racing window start hour (24h, inclusive) |

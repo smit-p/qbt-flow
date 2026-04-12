@@ -111,6 +111,39 @@ def _env_speed(key, default):
         return _parse_speed(val)
     return default
 
+# Size-suffix multipliers (for file sizes — base-1024)
+_SIZE_MULTIPLIERS = {
+    "b": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3,
+}
+_SIZE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*$")
+
+def _parse_size(raw):
+    """Parse a human-readable file size: 5MB, 500KB, 1GB, or plain bytes."""
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    raw = str(raw).strip()
+    if not raw:
+        return 0
+    m = _SIZE_RE.match(raw)
+    if m:
+        number = float(m.group(1))
+        suffix = m.group(2).lower()
+        if suffix:
+            mult = _SIZE_MULTIPLIERS.get(suffix)
+            if mult is not None:
+                return int(number * mult)
+    try:
+        return int(float(raw))
+    except ValueError:
+        return 0
+
+def _env_size(key, default):
+    """Read a file-size env-var, returning *default* if unset."""
+    val = os.environ.get(key)
+    if val is not None:
+        return _parse_size(val)
+    return default
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -212,7 +245,7 @@ RACING_NON_RACING_UL_LIMIT = int(_env_speed("RACING_NON_RACING_UL_LIMIT", 1 * 10
 
 LOG_FILE       = _env("LOG_FILE", str(_SCRIPT_DIR / "throttle.log"))
 LOG_LEVEL      = getattr(logging, _env("LOG_LEVEL", "INFO").upper(), logging.INFO)
-LOG_MAX_SIZE   = int(_env_speed("LOG_MAX_SIZE", 5 * 1024 * 1024))   # 5 MB default
+LOG_MAX_SIZE   = _env_size("LOG_MAX_SIZE", 5 * 1024 * 1024)        # 5 MB default
 LOG_BACKUP_COUNT = _env_int("LOG_BACKUP_COUNT", 3)
 
 # ---------------------------------------------------------------------------
