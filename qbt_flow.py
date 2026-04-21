@@ -668,11 +668,15 @@ def calculate_limits(session_count, stream_bps):
     remaining_dl_bps = max(0, TOTAL_BANDWIDTH_BPS - reserved_bps)
     remaining_ul_bps = max(0, TOTAL_UPLOAD_BPS - reserved_bps)
 
-    dl_bps = remaining_dl_bps * QBT_HEADROOM_FRACTION
     ul_bps = remaining_ul_bps * QBT_UPLOAD_FRACTION
 
-    # Convert to bytes/sec and enforce floor
-    dl_bytes = max(int(dl_bps / 8), MIN_QBT_DL_BYTES)
+    # QBT_HEADROOM_FRACTION >= 1.0 means "don't throttle downloads" — use 0 (unlimited).
+    # Values < 1.0 apply a proportional cap on remaining download bandwidth.
+    if QBT_HEADROOM_FRACTION >= 1.0:
+        dl_bytes = NORMAL_DL_BYTES  # 0 = unlimited
+    else:
+        dl_bps = remaining_dl_bps * QBT_HEADROOM_FRACTION
+        dl_bytes = max(int(dl_bps / 8), MIN_QBT_DL_BYTES)
     ul_bytes = max(int(ul_bps / 8), MIN_QBT_UL_BYTES)
 
     log.debug("Calc: streams=%.1f Mbps, reserved=%.1f Mbps (x%.2f), "
