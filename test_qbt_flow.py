@@ -333,6 +333,26 @@ class TestApplyLimits(unittest.TestCase):
             m.apply_limits(dl, ul, "THROTTLE")
         c.set_speed_limits.assert_called_once_with(dl, ul)
 
+    def test_split_ul_when_dl_is_unlimited(self):
+        """When DL is unlimited (0) but UL has a budget, UL must still be split."""
+        m.QBT_SPLIT_BETWEEN_INSTANCES = True
+        c1, c2 = self._make_client(), self._make_client()
+        ul = 50 * 1024 * 1024
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(0, ul, "THROTTLE")
+        # DL stays 0 (unlimited) for each; UL is halved
+        c1.set_speed_limits.assert_called_once_with(0, ul // 2)
+        c2.set_speed_limits.assert_called_once_with(0, ul // 2)
+
+    def test_split_both_unlimited_stays_unlimited(self):
+        """When both DL and UL are 0 (NORMAL), each instance gets (0, 0)."""
+        m.QBT_SPLIT_BETWEEN_INSTANCES = True
+        c1, c2 = self._make_client(), self._make_client()
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(0, 0, "NORMAL")
+        c1.set_speed_limits.assert_called_once_with(0, 0)
+        c2.set_speed_limits.assert_called_once_with(0, 0)
+
     def test_dry_run_skips_api_calls(self):
         m.DRY_RUN = True
         client = self._make_client()
@@ -825,14 +845,32 @@ class TestApplyLimitsRacing(unittest.TestCase):
 
     @patch("qbt_flow._is_racing_window", return_value=True)
     def test_racing_unlimited_gives_both_unlimited(self, _mock):
-        """When no Plex streams (dl_bytes=0), racing instance gets unlimited too."""
+        """When no streams (dl=0, ul=0 NORMAL), racing instance gets unlimited."""
         media  = self._make_client(39000)
         racing = self._make_client(39001)
         with patch.object(m, 'clients', [media, racing]):
             m.apply_limits(0, 0, "NORMAL")
-        # Racing instance gets 0 (unlimited) when dl_bytes=0
+        # Racing instance gets 0, 0 (both unlimited — no streams)
         racing.set_speed_limits.assert_called_once_with(0, 0)
         # Media still capped
+        media.set_speed_limits.assert_called_once_with(
+            m.RACING_NON_RACING_DL_LIMIT,
+            m.RACING_NON_RACING_UL_LIMIT,
+        )
+
+    @patch("qbt_flow._is_racing_window", return_value=True)
+    def test_racing_unlimited_dl_still_throttles_ul(self, _mock):
+        """When DL is unlimited (0) but UL has a budget (streams active),
+        the racing instance should get throttled UL, not unlimited."""
+        media  = self._make_client(39000)
+        racing = self._make_client(39001)
+        ul = 50 * 1024 * 1024
+        with patch.object(m, 'clients', [media, racing]):
+            m.apply_limits(0, ul, "THROTTLE")
+        # Racing instance: DL unlimited, UL = ul - cap
+        expected_ul = max(ul - m.RACING_NON_RACING_UL_LIMIT, m.MIN_QBT_UL_BYTES)
+        racing.set_speed_limits.assert_called_once_with(0, expected_ul)
+        # Media instance: still hard-capped on both
         media.set_speed_limits.assert_called_once_with(
             m.RACING_NON_RACING_DL_LIMIT,
             m.RACING_NON_RACING_UL_LIMIT,

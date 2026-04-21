@@ -610,19 +610,20 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
         if racing_active and num_instances > 1:
             # During racing window: cap the media instance, give the rest to racing
             if client_port == RACING_INSTANCE_PORT:
-                # Racing instance gets total minus the non-racing cap
-                if dl_bytes == 0:
-                    c_dl, c_ul = 0, 0  # unlimited
-                else:
-                    c_dl = max(dl_bytes - RACING_NON_RACING_DL_LIMIT, MIN_QBT_DL_BYTES)
-                    c_ul = max(ul_bytes - RACING_NON_RACING_UL_LIMIT, MIN_QBT_UL_BYTES)
+                # Racing instance gets total minus the non-racing cap.
+                # DL and UL are handled independently: 0 means unlimited for
+                # that direction, not a signal to skip the UL budget.
+                c_dl = 0 if dl_bytes == 0 else max(dl_bytes - RACING_NON_RACING_DL_LIMIT, MIN_QBT_DL_BYTES)
+                c_ul = 0 if ul_bytes == 0 else max(ul_bytes - RACING_NON_RACING_UL_LIMIT, MIN_QBT_UL_BYTES)
             else:
                 # Non-racing (media) instance gets hard cap
                 c_dl = RACING_NON_RACING_DL_LIMIT
                 c_ul = RACING_NON_RACING_UL_LIMIT
-        elif QBT_SPLIT_BETWEEN_INSTANCES and num_instances > 1 and dl_bytes > 0:
-            c_dl = max(dl_bytes // num_instances, MIN_QBT_DL_BYTES)
-            c_ul = max(ul_bytes // num_instances, MIN_QBT_UL_BYTES)
+        elif QBT_SPLIT_BETWEEN_INSTANCES and num_instances > 1:
+            # Split DL and UL independently. 0 (unlimited) stays unlimited;
+            # positive budgets are divided evenly between instances.
+            c_dl = 0 if dl_bytes == 0 else max(dl_bytes // num_instances, MIN_QBT_DL_BYTES)
+            c_ul = 0 if ul_bytes == 0 else max(ul_bytes // num_instances, MIN_QBT_UL_BYTES)
         else:
             c_dl, c_ul = dl_bytes, ul_bytes
 
