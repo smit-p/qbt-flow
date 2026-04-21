@@ -822,8 +822,11 @@ def main():
                 _status["streams"] = session_count
 
                 if session_count == 0:
-                    # Start ramp-up if transitioning from active streams
-                    if prev_session_count > 0 and RAMP_UP_STEPS > 0 and last_dl_limit:
+                    # Start ramp-up if transitioning from active streams.
+                    # Use last_ul_limit for the guard — last_dl_limit can be 0
+                    # (unlimited) when QBT_HEADROOM_FRACTION >= 1.0, making it
+                    # falsy even when throttling was actively applied.
+                    if prev_session_count > 0 and RAMP_UP_STEPS > 0 and last_ul_limit:
                         ramp_remaining = RAMP_UP_STEPS
                         ramp_dl = last_dl_limit
                         ramp_ul = last_ul_limit or 0
@@ -838,7 +841,8 @@ def main():
                             ramp_dl *= 2
                             ramp_ul *= 2
                             max_bw = int(TOTAL_BANDWIDTH_BPS / 8)
-                            if ramp_dl >= max_bw:
+                            max_ul = int(TOTAL_UPLOAD_BPS / 8)
+                            if (ramp_dl and ramp_dl >= max_bw) or ramp_ul >= max_ul:
                                 log.info("Ramp-up reached line speed, removing limits")
                                 apply_limits(NORMAL_DL_BYTES, NORMAL_UL_BYTES, "NORMAL")
                                 ramp_remaining = 0
