@@ -208,6 +208,13 @@ QBT_SPLIT_BETWEEN_INSTANCES = _env("QBT_SPLIT_BETWEEN_INSTANCES", "true").lower(
 # Requires QBT_SPLIT_BETWEEN_INSTANCES=true and more than one instance.
 QBT_DYNAMIC_SPLIT = _env("QBT_DYNAMIC_SPLIT", "false").lower() in ("true", "1", "yes")
 
+# Minimum speed a torrent must exceed to be counted as "active" during the
+# dynamic split.  Torrents that are stalled (stalledDL / stalledUP state) are
+# always excluded regardless of this threshold.  Set to 0 to only exclude
+# stalled-state torrents.
+QBT_ACTIVE_DL_THRESHOLD = int(_env_speed("QBT_ACTIVE_DL_THRESHOLD", 0))  # bytes/sec
+QBT_ACTIVE_UL_THRESHOLD = int(_env_speed("QBT_ACTIVE_UL_THRESHOLD", 0))  # bytes/sec
+
 # Hard floor: never throttle qbt below this.  Accepts plain numbers (bytes/sec)
 # or suffixes: 10MB/s, 5MB/s, etc.
 MIN_QBT_DL_BYTES = int(_env_speed("MIN_QBT_DL", 10 * 1024 * 1024))   # 10 MB/s
@@ -599,17 +606,29 @@ class QbtClient:
             log.warning("qbt %s GET %s failed: %s", self.base, path, e)
             return None
 
-    def get_torrent_activity(self):
+    def get_torrent_activity(self, dl_threshold=0, ul_threshold=0):
         """
-        Returns (dl_count, ul_count): number of torrents currently downloading
-        and seeding respectively. Returns None if the query fails — callers
-        should treat a failed instance as active (fail-open).
+        Returns (dl_count, ul_count): number of torrents that are genuinely
+        active above the given speed thresholds and not in a stalled state.
+        Stalled states (stalledDL / stalledUP) are always excluded.
+        Returns None if the query fails — callers should treat a failed
+        instance as active (fail-open).
         """
         dl_data = self._get_json("/api/v2/torrents/info?filter=downloading")
         ul_data = self._get_json("/api/v2/torrents/info?filter=seeding")
         if dl_data is None or ul_data is None:
             return None
-        return len(dl_data), len(ul_data)
+        dl_count = sum(
+            1 for t in dl_data
+            if t.get("state") != "stalledDL"
+            and t.get("dlspeed", 0) > dl_threshold
+        )
+        ul_count = sum(
+            1 for t in ul_data
+            if t.get("state") != "stalledUP"
+            and t.get("upspeed", 0) > ul_threshold
+        )
+        return dl_count, ul_count
 
 
 clients = [QbtClient(h, p, u, pw, s) for h, p, u, pw, s in QBT_INSTANCES]
@@ -654,7 +673,8 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
     if dynamic_split_active:
         raw_activity = {}
         for client in clients:
-            counts = client.get_torrent_activity()
+            counts = client.get_torrent_activity(
+                    QBT_ACTIVE_DL_THRESHOLD, QBT_ACTIVE_UL_THRESHOLD)
             if counts is None:
                 # Query failed — treat as 1 active in each direction so the
                 # instance gets an equal share (fail-open, not penalised).

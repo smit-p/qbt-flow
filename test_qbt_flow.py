@@ -560,35 +560,65 @@ class TestQbtClientGetTorrentActivity(unittest.TestCase):
         c.cookie = "SID=existing"
         return c
 
-    def test_returns_counts_when_both_queries_succeed(self):
-        dl_body = json.dumps([{"name": "a"}, {"name": "b"}]).encode()
-        ul_body = json.dumps([{"name": "c"}]).encode()
-        responses = [_make_response(dl_body), _make_response(ul_body)]
-        with patch("qbt_flow.urlopen", side_effect=responses):
-            c = self._make_client()
-            result = c.get_torrent_activity()
-        self.assertEqual(result, (2, 1))
+    def _resp(self, torrents):
+        return _make_response(json.dumps(torrents).encode())
+
+    def test_counts_normal_active_torrents(self):
+        dl = [{"state": "downloading", "dlspeed": 1024 * 1024}]
+        ul = [{"state": "uploading", "upspeed": 512 * 1024},
+              {"state": "uploading", "upspeed": 256 * 1024}]
+        with patch("qbt_flow.urlopen", side_effect=[self._resp(dl), self._resp(ul)]):
+            result = self._make_client().get_torrent_activity()
+        self.assertEqual(result, (1, 2))
+
+    def test_excludes_stalled_dl(self):
+        dl = [{"state": "stalledDL", "dlspeed": 0},
+              {"state": "downloading", "dlspeed": 500 * 1024}]
+        ul = [{"state": "uploading", "upspeed": 100}]
+        with patch("qbt_flow.urlopen", side_effect=[self._resp(dl), self._resp(ul)]):
+            result = self._make_client().get_torrent_activity()
+        self.assertEqual(result, (1, 1))
+
+    def test_excludes_stalled_ul(self):
+        dl = [{"state": "downloading", "dlspeed": 100}]
+        ul = [{"state": "stalledUP", "upspeed": 0},
+              {"state": "uploading", "upspeed": 100}]
+        with patch("qbt_flow.urlopen", side_effect=[self._resp(dl), self._resp(ul)]):
+            result = self._make_client().get_torrent_activity()
+        self.assertEqual(result, (1, 1))
+
+    def test_excludes_torrents_below_threshold(self):
+        threshold = 500 * 1024  # 500 KB/s
+        dl = [{"state": "downloading", "dlspeed": 100 * 1024},   # below
+              {"state": "downloading", "dlspeed": 1024 * 1024}]  # above
+        ul = [{"state": "uploading", "upspeed": 10 * 1024},      # below
+              {"state": "uploading", "upspeed": 600 * 1024}]     # above
+        with patch("qbt_flow.urlopen", side_effect=[self._resp(dl), self._resp(ul)]):
+            result = self._make_client().get_torrent_activity(threshold, threshold)
+        self.assertEqual(result, (1, 1))
+
+    def test_stalled_excluded_even_if_has_speed(self):
+        """A stalledDL torrent should be excluded regardless of its speed value."""
+        dl = [{"state": "stalledDL", "dlspeed": 999 * 1024}]
+        ul = [{"state": "stalledUP", "upspeed": 999 * 1024}]
+        with patch("qbt_flow.urlopen", side_effect=[self._resp(dl), self._resp(ul)]):
+            result = self._make_client().get_torrent_activity(0, 0)
+        self.assertEqual(result, (0, 0))
 
     def test_returns_none_when_dl_query_fails(self):
         with patch("qbt_flow.urlopen", side_effect=URLError("timeout")):
-            c = self._make_client()
-            result = c.get_torrent_activity()
+            result = self._make_client().get_torrent_activity()
         self.assertIsNone(result)
 
     def test_returns_none_when_ul_query_fails(self):
-        dl_body = json.dumps([]).encode()
-        dl_resp = _make_response(dl_body)
+        dl_resp = self._resp([])
         with patch("qbt_flow.urlopen", side_effect=[dl_resp, URLError("timeout")]):
-            c = self._make_client()
-            result = c.get_torrent_activity()
+            result = self._make_client().get_torrent_activity()
         self.assertIsNone(result)
 
     def test_returns_zero_zero_when_no_active_torrents(self):
-        dl_body = json.dumps([]).encode()
-        ul_body = json.dumps([]).encode()
-        with patch("qbt_flow.urlopen", side_effect=[_make_response(dl_body), _make_response(ul_body)]):
-            c = self._make_client()
-            result = c.get_torrent_activity()
+        with patch("qbt_flow.urlopen", side_effect=[self._resp([]), self._resp([])]):
+            result = self._make_client().get_torrent_activity()
         self.assertEqual(result, (0, 0))
 
 
