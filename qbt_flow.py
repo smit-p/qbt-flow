@@ -75,7 +75,9 @@ _SPEED_MULTIPLIERS = {
     # bits per second (SI / base-1000 — what ISPs advertise)
     "bps": 1, "kbps": 1_000, "mbps": 1_000_000, "gbps": 1_000_000_000,
     # bytes per second (binary / base-1024 — what apps display)
+    # With /s suffix (e.g. "10MB/s") or bare suffix (e.g. "10MB" / "10MBps")
     "b/s": 1, "kb/s": 1024, "mb/s": 1024**2, "gb/s": 1024**3,
+    "b": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3,
 }
 _SPEED_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z/]+)\s*$")
 
@@ -214,6 +216,17 @@ QBT_DYNAMIC_SPLIT = _env("QBT_DYNAMIC_SPLIT", "false").lower() in ("true", "1", 
 # stalled-state torrents.
 QBT_ACTIVE_DL_THRESHOLD = int(_env_speed("QBT_ACTIVE_DL_THRESHOLD", 0))  # bytes/sec
 QBT_ACTIVE_UL_THRESHOLD = int(_env_speed("QBT_ACTIVE_UL_THRESHOLD", 0))  # bytes/sec
+# Warn if the env var was explicitly set but couldn't be parsed (unrecognised suffix).
+for _thr_key, _thr_val in (("QBT_ACTIVE_DL_THRESHOLD", QBT_ACTIVE_DL_THRESHOLD),
+                            ("QBT_ACTIVE_UL_THRESHOLD", QBT_ACTIVE_UL_THRESHOLD)):
+    _raw = os.environ.get(_thr_key, "")
+    if _raw and _raw.strip() not in ("0", "") and _thr_val == 0:
+        log.warning(
+            "Config warning: %s=%r could not be parsed — treating as 0 "
+            "(unrecognised suffix?). Use formats like '500KB', '1MB/s', '500000'.",
+            _thr_key, _raw,
+        )
+del _thr_key, _thr_val, _raw
 
 # Hard floor: never throttle qbt below this.  Accepts plain numbers (bytes/sec)
 # or suffixes: 10MB/s, 5MB/s, etc.
@@ -500,7 +513,14 @@ def get_sessions():
             log.debug("%s: %d stream(s), %.1f Mbps", name, count, bps / 1_000_000)
 
     if not any_ok:
-        log.warning("All media servers unreachable")
+        all_in_backoff = all(
+            _server_backoffs.get(name, BackoffTracker()).should_skip()
+            for name, _, _, _ in _configured_servers
+        )
+        if all_in_backoff:
+            log.debug("All media servers in backoff, treating as unreachable")
+        else:
+            log.warning("All media servers unreachable")
         return -1, 0
     log.debug("Aggregated: %d stream(s), %.1f Mbps total", total_count, total_bps / 1_000_000)
     return total_count, total_bps
@@ -1008,12 +1028,16 @@ def main():
             _status["dl_limit"] = last_dl_limit or 0
             _status["ul_limit"] = last_ul_limit or 0
             _status["racing_active"] = _is_racing_window()
-            if ramp_remaining > 0:
-                _status["label"] = "RAMP-UP"
-            elif session_count > 0:
-                _status["label"] = "THROTTLE"
-            elif session_count == 0:
-                _status["label"] = "NORMAL"
+            # Only update label when servers are reachable — don't overwrite
+            # "UNREACHABLE" with "RAMP-UP" if a ramp was in progress when
+            # the server became unreachable.
+            if session_count >= 0:
+                if ramp_remaining > 0:
+                    _status["label"] = "RAMP-UP"
+                elif session_count > 0:
+                    _status["label"] = "THROTTLE"
+                else:
+                    _status["label"] = "NORMAL"
 
             stop_event.wait(POLL_INTERVAL)
     finally:

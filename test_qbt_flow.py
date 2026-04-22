@@ -1106,6 +1106,10 @@ class TestApplyLimitsRacing(unittest.TestCase):
         m.RACING_NON_RACING_UL_LIMIT = 5 * 1024 * 1024
         m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024
         m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024
+        self._orig_dynamic_split = m.QBT_DYNAMIC_SPLIT
+        self._orig_split = m.QBT_SPLIT_BETWEEN_INSTANCES
+        m.QBT_DYNAMIC_SPLIT = False
+        m.QBT_SPLIT_BETWEEN_INSTANCES = False
 
     def tearDown(self):
         m.last_dl_limit = None
@@ -1113,6 +1117,8 @@ class TestApplyLimitsRacing(unittest.TestCase):
         m.last_racing_active = None
         m.DRY_RUN = False
         m.RACING_WINDOW_ENABLED = False
+        m.QBT_DYNAMIC_SPLIT = self._orig_dynamic_split
+        m.QBT_SPLIT_BETWEEN_INSTANCES = self._orig_split
 
     def _make_client(self, port, success=True):
         client = MagicMock()
@@ -1985,6 +1991,604 @@ class TestValidateConfigServers(unittest.TestCase):
         ]
         m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
         m._validate_config()  # must not raise
+
+    def test_invalid_unreachable_action_exits(self):
+        m._configured_servers[:] = [("plex", "url", "tok", m.get_plex_sessions)]
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        orig = m.UNREACHABLE_ACTION
+        m.UNREACHABLE_ACTION = "banana"
+        try:
+            with self.assertRaises(SystemExit):
+                m._validate_config()
+        finally:
+            m.UNREACHABLE_ACTION = orig
+
+    def test_negative_headroom_fraction_exits(self):
+        m._configured_servers[:] = [("plex", "url", "tok", m.get_plex_sessions)]
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        orig = m.QBT_HEADROOM_FRACTION
+        m.QBT_HEADROOM_FRACTION = -0.1
+        try:
+            with self.assertRaises(SystemExit):
+                m._validate_config()
+        finally:
+            m.QBT_HEADROOM_FRACTION = orig
+
+    def test_upload_fraction_above_one_exits(self):
+        m._configured_servers[:] = [("plex", "url", "tok", m.get_plex_sessions)]
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        orig = m.QBT_UPLOAD_FRACTION
+        m.QBT_UPLOAD_FRACTION = 1.5
+        try:
+            with self.assertRaises(SystemExit):
+                m._validate_config()
+        finally:
+            m.QBT_UPLOAD_FRACTION = orig
+
+
+# ---------------------------------------------------------------------------
+# _parse_speed — bare byte suffixes (Bug fix coverage)
+# ---------------------------------------------------------------------------
+
+class TestParseSpeedBareSuffixes(unittest.TestCase):
+    """Bare byte suffixes without /s must parse correctly."""
+
+    def test_bare_kb(self):
+        self.assertEqual(m._parse_speed("500KB"), 500 * 1024)
+
+    def test_bare_mb(self):
+        self.assertEqual(m._parse_speed("10MB"), 10 * 1024 * 1024)
+
+    def test_bare_gb(self):
+        self.assertEqual(m._parse_speed("1GB"), 1024 ** 3)
+
+    def test_bare_b(self):
+        self.assertEqual(m._parse_speed("1024B"), 1024)
+
+    def test_bare_kb_lowercase(self):
+        self.assertEqual(m._parse_speed("500kb"), 500 * 1024)
+
+    def test_bare_mb_lowercase(self):
+        self.assertEqual(m._parse_speed("10mb"), 10 * 1024 * 1024)
+
+    def test_bare_mb_mixed_case(self):
+        self.assertEqual(m._parse_speed("10Mb"), 10 * 1024 * 1024)
+
+    def test_fractional_bare_mb(self):
+        self.assertAlmostEqual(m._parse_speed("1.5MB"), 1.5 * 1024 * 1024)
+
+    def test_kb_s_still_works(self):
+        """Existing KB/s suffix must not be broken."""
+        self.assertEqual(m._parse_speed("512KB/s"), 512 * 1024)
+
+    def test_mb_s_still_works(self):
+        self.assertEqual(m._parse_speed("10MB/s"), 10 * 1024 * 1024)
+
+    def test_mbps_still_works(self):
+        """ISP-style Mbps (megabits) must not be confused with bare MB (megabytes)."""
+        # 100Mbps = 100,000,000 bps (SI), not 100 * 1024^2
+        self.assertEqual(m._parse_speed("100Mbps"), 100_000_000)
+
+    def test_bare_suffix_env_threshold(self):
+        """The config scenario that triggered the bug: 500KB threshold parses > 0."""
+        self.assertGreater(m._parse_speed("500KB"), 0)
+
+
+# ---------------------------------------------------------------------------
+# get_sessions — backoff vs failure logging (Bug fix coverage)
+# ---------------------------------------------------------------------------
+
+class TestGetSessionsBackoffLogging(unittest.TestCase):
+    def setUp(self):
+        self._orig_servers  = m._configured_servers[:]
+        self._orig_backoffs = dict(m._server_backoffs)
+        m._server_backoffs.clear()
+
+    def tearDown(self):
+        m._configured_servers[:] = self._orig_servers
+        m._server_backoffs.clear()
+        m._server_backoffs.update(self._orig_backoffs)
+
+    def test_all_in_backoff_returns_minus_one(self):
+        """When all servers are in backoff, returns (-1, 0) without calling fetch."""
+        bt = m.BackoffTracker(300)
+        bt.record_failure()
+        m._server_backoffs["plex"] = bt
+        fetch_fn = MagicMock()
+        m._configured_servers[:] = [("plex", "u", "t", fetch_fn)]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, -1)
+        fetch_fn.assert_not_called()
+
+    def test_all_in_backoff_does_not_log_unreachable_warning(self):
+        """Backoff-skip must use debug log, not the 'unreachable' warning."""
+        bt = m.BackoffTracker(300)
+        bt.record_failure()
+        m._server_backoffs["plex"] = bt
+        m._configured_servers[:] = [("plex", "u", "t", MagicMock())]
+        with self.assertLogs("qbt_flow", level="WARNING") as cm:
+            # Force at least one WARNING so assertLogs doesn't fail if none
+            m.get_sessions()
+            m.log.warning("sentinel")  # ensure at least one record
+        # The only WARNING should be our sentinel, not "unreachable"
+        warning_msgs = [r for r in cm.output if "unreachable" in r.lower()]
+        self.assertEqual(len(warning_msgs), 0)
+
+    def test_genuine_failure_logs_unreachable(self):
+        """A real server failure (not backoff) must log 'unreachable' warning."""
+        # No backoff set, server actually returns -1
+        fetch_fn = MagicMock(return_value=(-1, 0))
+        m._configured_servers[:] = [("plex", "u", "t", fetch_fn)]
+        with self.assertLogs("qbt_flow", level="WARNING") as cm:
+            m.get_sessions()
+        unreachable_logs = [r for r in cm.output if "unreachable" in r.lower()]
+        self.assertTrue(len(unreachable_logs) >= 1)
+
+    def test_partial_backoff_still_serves_other_server(self):
+        """One server in backoff, another healthy → returns healthy server data."""
+        bt = m.BackoffTracker(300)
+        bt.record_failure()
+        m._server_backoffs["plex"] = bt
+        plex_fn = MagicMock()
+        jf_fn = MagicMock(return_value=(2, 40_000_000))
+        m._configured_servers[:] = [
+            ("plex", "u1", "t1", plex_fn),
+            ("jellyfin", "u2", "t2", jf_fn),
+        ]
+        count, bps = m.get_sessions()
+        self.assertEqual(count, 2)
+        self.assertEqual(bps, 40_000_000)
+        plex_fn.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# main() — UNREACHABLE label not overwritten by RAMP-UP (Bug fix coverage)
+# ---------------------------------------------------------------------------
+
+class TestMainStatusLabelUnreachable(unittest.TestCase):
+    def setUp(self):
+        self._orig_token = m.PLEX_TOKEN
+        self._orig_inst  = m.QBT_INSTANCES
+        self._orig_dry   = m.DRY_RUN
+        self._orig_ramp  = m.RAMP_UP_STEPS
+        self._orig_poll  = m.POLL_INTERVAL
+        m.POLL_INTERVAL  = 0
+        m.last_dl_limit  = None
+        m.last_ul_limit  = None
+        m.last_racing_active = None
+
+    def tearDown(self):
+        m.PLEX_TOKEN    = self._orig_token
+        m.QBT_INSTANCES = self._orig_inst
+        m.DRY_RUN       = self._orig_dry
+        m.RAMP_UP_STEPS = self._orig_ramp
+        m.POLL_INTERVAL = self._orig_poll
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.stop_event.clear()
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_unreachable_does_not_override_with_ramp_up_label(
+        self, mock_sessions, mock_apply, _srv
+    ):
+        """If server becomes unreachable while a ramp was in progress, the
+        status label must stay 'UNREACHABLE', not become 'RAMP-UP'."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 3
+
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (2, 50_000_000)   # cycle 1: streams
+            if call_count[0] == 2:
+                return (0, 0)            # cycle 2: streams drop → ramp begins
+            m.stop_event.set()           # cycle 3: trigger exit after unreachable
+            return (-1, 0)               # cycle 3+: server unreachable
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            if apply_count[0] == 1:
+                m.last_dl_limit = 50 * 1024 * 1024
+                m.last_ul_limit = 25 * 1024 * 1024
+
+        mock_apply.side_effect = apply_side_effect
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        # After the unreachable cycle the label must be UNREACHABLE, not RAMP-UP
+        self.assertEqual(m._status["label"], "UNREACHABLE")
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_label_returns_to_normal_after_recovery(
+        self, mock_sessions, mock_apply, _srv
+    ):
+        """After recovering from UNREACHABLE, label should reflect stream state."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 0
+
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (-1, 0)           # unreachable
+            return (0, 0)               # recovered, no streams
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            if apply_count[0] >= 2:
+                m.stop_event.set()
+
+        mock_apply.side_effect = apply_side_effect
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        self.assertIn(m._status["label"], ("NORMAL", "THROTTLE"))
+
+
+# ---------------------------------------------------------------------------
+# Integration: calculate_limits with QBT_HEADROOM_FRACTION=1.0 → unlimited DL
+# ---------------------------------------------------------------------------
+
+class TestCalculateLimitsHeadroomOne(unittest.TestCase):
+    def setUp(self):
+        self._orig_headroom = m.QBT_HEADROOM_FRACTION
+        self._orig_bw = m.TOTAL_BANDWIDTH_BPS
+        self._orig_ul = m.TOTAL_UPLOAD_BPS
+        m.TOTAL_BANDWIDTH_BPS = 1_000_000_000
+        m.TOTAL_UPLOAD_BPS    = 1_000_000_000
+        m.QBT_UPLOAD_FRACTION = 0.9
+        m.STREAM_OVERHEAD_FACTOR = 1.25
+        m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024
+        m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024
+
+    def tearDown(self):
+        m.QBT_HEADROOM_FRACTION = self._orig_headroom
+        m.TOTAL_BANDWIDTH_BPS   = self._orig_bw
+        m.TOTAL_UPLOAD_BPS      = self._orig_ul
+
+    def test_headroom_one_gives_unlimited_dl(self):
+        """QBT_HEADROOM_FRACTION=1.0 should result in DL=0 (unlimited)."""
+        m.QBT_HEADROOM_FRACTION = 1.0
+        dl, ul, _ = m.calculate_limits(2, 100_000_000)
+        self.assertEqual(dl, m.NORMAL_DL_BYTES)  # 0
+
+    def test_headroom_below_one_throttles_dl(self):
+        """Fractions < 1.0 should cap DL."""
+        m.QBT_HEADROOM_FRACTION = 0.5
+        dl, ul, _ = m.calculate_limits(1, 0)
+        self.assertGreater(dl, 0)
+        self.assertLessEqual(dl, int(1_000_000_000 * 0.5 / 8))
+
+    def test_ul_always_throttled_regardless_of_headroom(self):
+        """UL throttle should apply even when DL is unlimited."""
+        m.QBT_HEADROOM_FRACTION = 1.0
+        dl, ul, _ = m.calculate_limits(2, 200_000_000)
+        self.assertEqual(dl, 0)           # unlimited
+        self.assertGreater(ul, 0)         # still throttled
+
+
+# ---------------------------------------------------------------------------
+# Integration: full calculate → apply pipeline
+# ---------------------------------------------------------------------------
+
+class TestCalculateApplyPipeline(unittest.TestCase):
+    """Verify the calculate_limits → apply_limits pipeline produces consistent
+    results end-to-end, catching any boundary or sign-flip issues."""
+
+    def setUp(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.last_detail = None
+        m.last_activity = {}
+        m.DRY_RUN = False
+        m.QBT_SPLIT_BETWEEN_INSTANCES = False
+        m.QBT_DYNAMIC_SPLIT = False
+        m.RACING_WINDOW_ENABLED = False
+        m.TOTAL_BANDWIDTH_BPS   = 500_000_000   # 500 Mbps DL
+        m.TOTAL_UPLOAD_BPS      = 100_000_000   #  100 Mbps UL
+        m.QBT_HEADROOM_FRACTION = 0.8
+        m.QBT_UPLOAD_FRACTION   = 0.9
+        m.STREAM_OVERHEAD_FACTOR = 1.25
+        m.MIN_QBT_DL_BYTES = 1 * 1024 * 1024
+        m.MIN_QBT_UL_BYTES = 1 * 1024 * 1024
+
+    def tearDown(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.last_detail = None
+        m.last_activity = {}
+
+    def _make_client(self):
+        c = MagicMock()
+        c.ensure_logged_in.return_value = True
+        c.set_speed_limits.return_value = True
+        c.base = "http://localhost:8080"
+        c.cookie = "SID=test"
+        return c
+
+    def test_two_streams_at_4k_throttles_correctly(self):
+        """2 streams × ~25 Mbps each = 50 Mbps reserved."""
+        stream_bps = 2 * 25_000_000
+        dl, ul, detail = m.calculate_limits(2, stream_bps)
+        client = self._make_client()
+        with patch.object(m, "clients", [client]):
+            m.apply_limits(dl, ul, "THROTTLE", detail)
+        called_dl, called_ul = client.set_speed_limits.call_args[0]
+        # DL floor: max(0, 500M - 50M*1.25) * 0.8 / 8 = max(0, 437.5M) * 0.8 / 8
+        expected_dl = int((500_000_000 - stream_bps * 1.25) * 0.8 / 8)
+        self.assertEqual(called_dl, expected_dl)
+        # UL: max(0, 100M - 62.5M) * 0.9 / 8
+        expected_ul = max(int((100_000_000 - stream_bps * 1.25) * 0.9 / 8),
+                          m.MIN_QBT_UL_BYTES)
+        self.assertEqual(called_ul, expected_ul)
+
+    def test_state_updated_after_pipeline(self):
+        """last_dl_limit and last_ul_limit must reflect calculated values."""
+        dl, ul, detail = m.calculate_limits(1, 10_000_000)
+        client = self._make_client()
+        with patch.object(m, "clients", [client]):
+            m.apply_limits(dl, ul, "THROTTLE", detail)
+        self.assertEqual(m.last_dl_limit, dl)
+        self.assertEqual(m.last_ul_limit, ul)
+
+    def test_massive_stream_clamps_to_floor(self):
+        """Streams consuming more than line speed → min floor."""
+        dl, ul, detail = m.calculate_limits(1, 10_000_000_000_000)
+        client = self._make_client()
+        with patch.object(m, "clients", [client]):
+            m.apply_limits(dl, ul, "THROTTLE", detail)
+        called_dl, called_ul = client.set_speed_limits.call_args[0]
+        self.assertEqual(called_dl, m.MIN_QBT_DL_BYTES)
+        self.assertEqual(called_ul, m.MIN_QBT_UL_BYTES)
+
+    def test_zero_streams_gives_unlimited(self):
+        """No streams + headroom=1.0 → 0/0 (unlimited)."""
+        m.QBT_HEADROOM_FRACTION = 1.0
+        dl, ul, _ = m.calculate_limits(0, 0)
+        self.assertEqual(dl, 0)
+
+
+# ---------------------------------------------------------------------------
+# Integration: dynamic split with real torrent data flow
+# ---------------------------------------------------------------------------
+
+class TestDynamicSplitIntegration(unittest.TestCase):
+    """End-to-end: qBt API → get_torrent_activity → apply_limits proportional split."""
+
+    def setUp(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.last_detail = None
+        m.last_activity = {}
+        m.DRY_RUN = False
+        m.QBT_SPLIT_BETWEEN_INSTANCES = True
+        m.QBT_DYNAMIC_SPLIT = True
+        m.RACING_WINDOW_ENABLED = False
+        m.MIN_QBT_DL_BYTES = 1 * 1024 * 1024
+        m.MIN_QBT_UL_BYTES = 1 * 1024 * 1024
+        m.QBT_ACTIVE_DL_THRESHOLD = 0
+        m.QBT_ACTIVE_UL_THRESHOLD = 0
+
+    def tearDown(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.last_detail = None
+        m.last_activity = {}
+        m.QBT_DYNAMIC_SPLIT = False
+
+    def _make_real_client(self, port, dl_torrents, ul_torrents):
+        """Create a client whose _get_json calls return actual torrent data."""
+        c = m.QbtClient("localhost", port, "admin", "pass")
+        c.cookie = "SID=test"
+
+        dl_data = [{"state": "downloading", "dlspeed": 5 * 1024 * 1024}
+                   for _ in range(dl_torrents)]
+        ul_data = [{"state": "uploading", "upspeed": 2 * 1024 * 1024}
+                   for _ in range(ul_torrents)]
+
+        def fake_get_json(path):
+            if "filter=downloading" in path:
+                return dl_data
+            if "filter=seeding" in path:
+                return ul_data
+            return []
+
+        c._get_json = fake_get_json
+        c.ensure_logged_in = MagicMock(return_value=True)
+        c.set_speed_limits = MagicMock(return_value=True)
+        return c
+
+    def test_3_vs_1_dl_gives_75_25_split(self):
+        """3 active DL torrents vs 1 → client A gets 75%, client B gets 25%."""
+        dl_budget = 100 * 1024 * 1024
+        ul_budget = 40 * 1024 * 1024
+        c1 = self._make_real_client(8080, dl_torrents=3, ul_torrents=1)
+        c2 = self._make_real_client(8081, dl_torrents=1, ul_torrents=1)
+        with patch.object(m, "clients", [c1, c2]):
+            m.apply_limits(dl_budget, ul_budget, "THROTTLE")
+        c1_dl, c1_ul = c1.set_speed_limits.call_args[0]
+        c2_dl, c2_ul = c2.set_speed_limits.call_args[0]
+        self.assertEqual(c1_dl, max(int(dl_budget * 3 / 4), m.MIN_QBT_DL_BYTES))
+        self.assertEqual(c2_dl, max(int(dl_budget * 1 / 4), m.MIN_QBT_DL_BYTES))
+
+    def test_threshold_filters_slow_torrents(self):
+        """Torrents below threshold are excluded → treated as idle."""
+        m.QBT_ACTIVE_DL_THRESHOLD = 10 * 1024 * 1024  # 10 MB/s
+
+        # Both clients have torrents downloading at 5 MB/s, below the 10 MB/s threshold
+        dl_budget = 100 * 1024 * 1024
+        ul_budget = 40 * 1024 * 1024
+        c1 = self._make_real_client(8080, dl_torrents=2, ul_torrents=0)
+        c2 = self._make_real_client(8081, dl_torrents=1, ul_torrents=0)
+        with patch.object(m, "clients", [c1, c2]):
+            m.apply_limits(dl_budget, ul_budget, "THROTTLE")
+        # Both are below threshold → all-idle fallback → equal split
+        c1_dl, _ = c1.set_speed_limits.call_args[0]
+        c2_dl, _ = c2.set_speed_limits.call_args[0]
+        self.assertEqual(c1_dl, dl_budget // 2)
+        self.assertEqual(c2_dl, dl_budget // 2)
+
+
+# ---------------------------------------------------------------------------
+# Integration: full main() loop cycles — multi-cycle scenario
+# ---------------------------------------------------------------------------
+
+class TestMainLoopMultiCycle(unittest.TestCase):
+    """Multi-cycle integration tests for the main polling loop."""
+
+    def setUp(self):
+        self._orig_token = m.PLEX_TOKEN
+        self._orig_inst  = m.QBT_INSTANCES
+        self._orig_dry   = m.DRY_RUN
+        self._orig_ramp  = m.RAMP_UP_STEPS
+        self._orig_poll  = m.POLL_INTERVAL
+        m.POLL_INTERVAL  = 0
+        m.last_dl_limit  = None
+        m.last_ul_limit  = None
+        m.last_racing_active = None
+
+    def tearDown(self):
+        m.PLEX_TOKEN    = self._orig_token
+        m.QBT_INSTANCES = self._orig_inst
+        m.DRY_RUN       = self._orig_dry
+        m.RAMP_UP_STEPS = self._orig_ramp
+        m.POLL_INTERVAL = self._orig_poll
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.stop_event.clear()
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_throttle_then_normal_cycle(self, mock_sessions, mock_apply, _srv):
+        """Streams → throttle; streams stop → NORMAL. Verifies label sequence."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 0
+
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (1, 20_000_000)  # throttle
+            return (0, 0)               # normal
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            if apply_count[0] >= 2:
+                m.stop_event.set()
+
+        mock_apply.side_effect = apply_side_effect
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        labels = [c.args[2] for c in mock_apply.call_args_list]
+        self.assertIn("THROTTLE", labels)
+        self.assertIn("NORMAL", labels)
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_unreachable_then_streams_resumes_throttle(
+        self, mock_sessions, mock_apply, _srv
+    ):
+        """UNREACHABLE → streams active → THROTTLE applied."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 0
+        m.UNREACHABLE_ACTION = "keep"
+
+        call_count = [0]
+        def sessions_side_effect():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (-1, 0)           # unreachable
+            return (2, 40_000_000)       # recovered with streams
+
+        mock_sessions.side_effect = lambda: sessions_side_effect()
+
+        apply_count = [0]
+        def apply_side_effect(*args, **kwargs):
+            apply_count[0] += 1
+            if apply_count[0] >= 1:
+                m.stop_event.set()
+
+        mock_apply.side_effect = apply_side_effect
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        labels = [c.args[2] for c in mock_apply.call_args_list]
+        self.assertIn("THROTTLE", labels)
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions")
+    def test_status_streams_count_tracked(self, mock_sessions, mock_apply, _srv):
+        """_status['streams'] reflects the last seen stream count."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 0
+
+        mock_sessions.return_value = (3, 60_000_000)
+
+        def stop(*args, **kwargs):
+            m.stop_event.set()
+
+        mock_apply.side_effect = stop
+
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            m.main()
+
+        self.assertEqual(m._status["streams"], 3)
+
+    @patch("qbt_flow._start_status_server")
+    @patch("qbt_flow.apply_limits")
+    @patch("qbt_flow.get_sessions", return_value=(0, 0))
+    def test_shutdown_applies_unlimited_even_in_dry_run_off(
+        self, mock_sessions, mock_apply, _srv
+    ):
+        """On exit, apply_limits(0, 0, 'SHUTDOWN', force=True) is called."""
+        m.PLEX_TOKEN    = "test-token"
+        m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
+        m.RAMP_UP_STEPS = 0
+        m.stop_event.set()   # exit immediately
+
+        with patch("sys.argv", ["prog"]):   # NOT --dry-run
+            m.main()
+
+        shutdown = [c for c in mock_apply.call_args_list if "SHUTDOWN" in str(c)]
+        self.assertTrue(len(shutdown) > 0)
+        # Verify force=True
+        kw = shutdown[0].kwargs
+        args = shutdown[0].args
+        force_val = kw.get("force") or (len(args) > 3 and args[3])
+        self.assertTrue(force_val)
 
 
 if __name__ == "__main__":
