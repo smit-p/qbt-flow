@@ -279,7 +279,7 @@ last_dl_limit = None
 last_ul_limit = None
 last_racing_active = None
 last_detail = None
-last_activity: dict = {}   # id(client) -> (dl_active: bool, ul_active: bool)
+last_activity: dict = {}   # id(client) -> (dl_count: int, ul_count: int)
 
 _start_time = 0.0
 _status = {
@@ -656,27 +656,29 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
         for client in clients:
             counts = client.get_torrent_activity()
             if counts is None:
-                raw_activity[id(client)] = (True, True)  # fail-open
+                # Query failed — treat as 1 active in each direction so the
+                # instance gets an equal share (fail-open, not penalised).
+                raw_activity[id(client)] = (1, 1)
             else:
-                dl_cnt, ul_cnt = counts
-                raw_activity[id(client)] = (dl_cnt > 0, ul_cnt > 0)
+                raw_activity[id(client)] = counts  # (dl_cnt, ul_cnt)
 
-        dl_active_n = sum(1 for dl, _ in raw_activity.values() if dl)
-        ul_active_n = sum(1 for _, ul in raw_activity.values() if ul)
+        # Sum of torrent counts across active instances (excludes idle zeros).
+        dl_active_total = sum(cnt for cnt, _ in raw_activity.values() if cnt > 0)
+        ul_active_total = sum(cnt for _, cnt in raw_activity.values() if cnt > 0)
 
-        # If no instance is active in a direction, treat all as active to avoid
-        # locking every instance at the floor when no torrents are running.
-        if dl_active_n == 0:
-            raw_activity = {k: (True, ul) for k, (_, ul) in raw_activity.items()}
-            dl_active_n = num_instances
-        if ul_active_n == 0:
-            raw_activity = {k: (dl, True) for k, (dl, _) in raw_activity.items()}
-            ul_active_n = num_instances
+        # If no instance is active in a direction, treat all as having 1 active
+        # torrent so the budget is split equally (no locking at the floor).
+        if dl_active_total == 0:
+            raw_activity = {k: (1, ul) for k, (_, ul) in raw_activity.items()}
+            dl_active_total = num_instances
+        if ul_active_total == 0:
+            raw_activity = {k: (dl, 1) for k, (dl, _) in raw_activity.items()}
+            ul_active_total = num_instances
         activity = raw_activity
     else:
-        activity = {id(c): (True, True) for c in clients}
-        dl_active_n = num_instances
-        ul_active_n = num_instances
+        activity = {id(c): (1, 1) for c in clients}
+        dl_active_total = num_instances
+        ul_active_total = num_instances
 
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
     # But always re-apply when label/detail/activity changes.
@@ -694,7 +696,9 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
 
     for client in clients:
         client_port = int(client.base.rsplit(":", 1)[-1])
-        is_dl_active, is_ul_active = activity[id(client)]
+        dl_cnt, ul_cnt = activity[id(client)]
+        is_dl_active = dl_cnt > 0
+        is_ul_active = ul_cnt > 0
 
         if racing_active and num_instances > 1:
             # During racing window: cap the media instance, give the rest to racing
@@ -710,19 +714,20 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
                 c_ul = RACING_NON_RACING_UL_LIMIT
         elif QBT_SPLIT_BETWEEN_INSTANCES and num_instances > 1:
             if dynamic_split_active:
-                # Give active instances their full share; idle instances get
-                # MIN as a holding floor (they'll be re-evaluated next cycle).
+                # Proportional split: each instance's share is weighted by its
+                # active torrent count.  Idle instances (count=0) get the MIN
+                # floor; active instances get (my_count / total_active_count).
                 if dl_bytes == 0:
                     c_dl = 0
                 elif is_dl_active:
-                    c_dl = max(dl_bytes // dl_active_n, MIN_QBT_DL_BYTES)
+                    c_dl = max(int(dl_bytes * dl_cnt / dl_active_total), MIN_QBT_DL_BYTES)
                 else:
                     c_dl = MIN_QBT_DL_BYTES
 
                 if ul_bytes == 0:
                     c_ul = 0
                 elif is_ul_active:
-                    c_ul = max(ul_bytes // ul_active_n, MIN_QBT_UL_BYTES)
+                    c_ul = max(int(ul_bytes * ul_cnt / ul_active_total), MIN_QBT_UL_BYTES)
                 else:
                     c_ul = MIN_QBT_UL_BYTES
             else:

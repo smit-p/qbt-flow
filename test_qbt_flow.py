@@ -649,15 +649,35 @@ class TestApplyLimitsDynamic(unittest.TestCase):
         idle.set_speed_limits.assert_called_once_with(m.MIN_QBT_DL_BYTES, m.MIN_QBT_UL_BYTES)
 
     def test_both_active_splits_equally(self):
-        """When both instances have active downloads, budget is split 50/50."""
+        """When both instances have the same torrent count, budget is split 50/50."""
         dl = 100 * 1024 * 1024
         ul = 50 * 1024 * 1024
-        c1 = self._make_client(8080, dl_count=2, ul_count=2)
+        c1 = self._make_client(8080, dl_count=1, ul_count=1)
         c2 = self._make_client(8081, dl_count=1, ul_count=1)
         with patch.object(m, 'clients', [c1, c2]):
             m.apply_limits(dl, ul, "THROTTLE")
         c1.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
         c2.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
+
+    def test_proportional_split_by_torrent_count(self):
+        """Budget is distributed proportionally to active torrent counts:
+        3 vs 1 active downloads => 75 / 25 split."""
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        c1 = self._make_client(8080, dl_count=3, ul_count=1)
+        c2 = self._make_client(8081, dl_count=1, ul_count=3)
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        # DL total=4: c1 gets 3/4, c2 gets 1/4
+        # UL total=4: c1 gets 1/4, c2 gets 3/4
+        c1.set_speed_limits.assert_called_once_with(
+            max(int(dl * 3 / 4), m.MIN_QBT_DL_BYTES),
+            max(int(ul * 1 / 4), m.MIN_QBT_UL_BYTES),
+        )
+        c2.set_speed_limits.assert_called_once_with(
+            max(int(dl * 1 / 4), m.MIN_QBT_DL_BYTES),
+            max(int(ul * 3 / 4), m.MIN_QBT_UL_BYTES),
+        )
 
     def test_dl_idle_ul_active_handled_independently(self):
         """DL and UL activity are independent: an instance can be idle for DL
