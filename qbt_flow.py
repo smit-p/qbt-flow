@@ -201,6 +201,13 @@ QBT_UPLOAD_FRACTION   = _env_float("QBT_UPLOAD_FRACTION",   0.9)
 # If true, each instance gets (total / N). If false, each gets the full amount.
 QBT_SPLIT_BETWEEN_INSTANCES = _env("QBT_SPLIT_BETWEEN_INSTANCES", "true").lower() in ("true", "1", "yes")
 
+# Dynamic split: query each qBt instance for active torrent counts and give the
+# full budget only to instances that are actively downloading/seeding.  Idle
+# instances receive the hard floor (MIN_QBT_DL / MIN_QBT_UL) as a holding cap.
+# On the next poll cycle the split re-evaluates automatically.
+# Requires QBT_SPLIT_BETWEEN_INSTANCES=true and more than one instance.
+QBT_DYNAMIC_SPLIT = _env("QBT_DYNAMIC_SPLIT", "false").lower() in ("true", "1", "yes")
+
 # Hard floor: never throttle qbt below this.  Accepts plain numbers (bytes/sec)
 # or suffixes: 10MB/s, 5MB/s, etc.
 MIN_QBT_DL_BYTES = int(_env_speed("MIN_QBT_DL", 10 * 1024 * 1024))   # 10 MB/s
@@ -272,6 +279,7 @@ last_dl_limit = None
 last_ul_limit = None
 last_racing_active = None
 last_detail = None
+last_activity: dict = {}   # id(client) -> (dl_active: bool, ul_active: bool)
 
 _start_time = 0.0
 _status = {
@@ -563,6 +571,46 @@ class QbtClient:
             return self.login()
         return True
 
+    def _get_json(self, path):
+        """Authenticated GET request returning parsed JSON, or None on failure."""
+        url = f"{self.base}{path}"
+        req = Request(url)
+        if self.cookie:
+            req.add_header("Cookie", self.cookie)
+        try:
+            with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                return json.loads(resp.read().decode())
+        except HTTPError as e:
+            if e.code == 403 and self.cookie:
+                # Auth expired — re-login and retry once
+                self.cookie = None
+                if self.login():
+                    req2 = Request(url)
+                    req2.add_header("Cookie", self.cookie)
+                    try:
+                        with urlopen(req2, timeout=REQUEST_TIMEOUT) as resp:
+                            return json.loads(resp.read().decode())
+                    except (URLError, HTTPError, ValueError) as e2:
+                        log.warning("qbt %s GET %s retry failed: %s", self.base, path, e2)
+            else:
+                log.warning("qbt %s GET %s failed: %s", self.base, path, e)
+            return None
+        except (URLError, ValueError) as e:
+            log.warning("qbt %s GET %s failed: %s", self.base, path, e)
+            return None
+
+    def get_torrent_activity(self):
+        """
+        Returns (dl_count, ul_count): number of torrents currently downloading
+        and seeding respectively. Returns None if the query fails — callers
+        should treat a failed instance as active (fail-open).
+        """
+        dl_data = self._get_json("/api/v2/torrents/info?filter=downloading")
+        ul_data = self._get_json("/api/v2/torrents/info?filter=seeding")
+        if dl_data is None or ul_data is None:
+            return None
+        return len(dl_data), len(ul_data)
+
 
 clients = [QbtClient(h, p, u, pw, s) for h, p, u, pw, s in QBT_INSTANCES]
 
@@ -580,7 +628,7 @@ def _is_racing_window():
 
 
 def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
-    global last_dl_limit, last_ul_limit, last_racing_active, last_detail
+    global last_dl_limit, last_ul_limit, last_racing_active, last_detail, last_activity
 
     racing_active = _is_racing_window()
 
@@ -591,21 +639,62 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
         else:
             log.info("Exiting racing window, resuming normal split")
 
+    num_instances = len(clients)
+    dynamic_split_active = (
+        QBT_SPLIT_BETWEEN_INSTANCES
+        and QBT_DYNAMIC_SPLIT
+        and num_instances > 1
+        and not racing_active   # racing window has its own allocation logic
+        and not DRY_RUN         # don't make extra API calls in dry-run
+    )
+
+    # Pre-query per-instance torrent activity so we know which instances are
+    # actively downloading/seeding *before* the tolerance check — activity
+    # changes must always trigger a re-apply even if the total budget is same.
+    if dynamic_split_active:
+        raw_activity = {}
+        for client in clients:
+            counts = client.get_torrent_activity()
+            if counts is None:
+                raw_activity[id(client)] = (True, True)  # fail-open
+            else:
+                dl_cnt, ul_cnt = counts
+                raw_activity[id(client)] = (dl_cnt > 0, ul_cnt > 0)
+
+        dl_active_n = sum(1 for dl, _ in raw_activity.values() if dl)
+        ul_active_n = sum(1 for _, ul in raw_activity.values() if ul)
+
+        # If no instance is active in a direction, treat all as active to avoid
+        # locking every instance at the floor when no torrents are running.
+        if dl_active_n == 0:
+            raw_activity = {k: (True, ul) for k, (_, ul) in raw_activity.items()}
+            dl_active_n = num_instances
+        if ul_active_n == 0:
+            raw_activity = {k: (dl, True) for k, (dl, _) in raw_activity.items()}
+            ul_active_n = num_instances
+        activity = raw_activity
+    else:
+        activity = {id(c): (True, True) for c in clients}
+        dl_active_n = num_instances
+        ul_active_n = num_instances
+
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
-    # But always re-apply when label/detail changes (e.g. stream count).
+    # But always re-apply when label/detail/activity changes.
     if not force and last_dl_limit is not None and last_ul_limit is not None:
         dl_diff = abs(dl_bytes - last_dl_limit) / max(last_dl_limit, 1)
         ul_diff = abs(ul_bytes - last_ul_limit) / max(last_ul_limit, 1)
         detail_changed = detail != last_detail
-        if dl_diff < 0.01 and ul_diff < 0.01 and racing_active == last_racing_active and not detail_changed:
-            log.debug("Limits unchanged (dl±%.1f%% ul±%.1f%%), skipping", dl_diff * 100, ul_diff * 100)
+        activity_changed = QBT_DYNAMIC_SPLIT and activity != last_activity
+        if (dl_diff < 0.01 and ul_diff < 0.01
+                and racing_active == last_racing_active
+                and not detail_changed and not activity_changed):
+            log.debug("Limits unchanged (dl\u00b1%.1f%% ul\u00b1%.1f%%), skipping",
+                      dl_diff * 100, ul_diff * 100)
             return
-
-    # Compute per-instance limits
-    num_instances = len(clients)
 
     for client in clients:
         client_port = int(client.base.rsplit(":", 1)[-1])
+        is_dl_active, is_ul_active = activity[id(client)]
 
         if racing_active and num_instances > 1:
             # During racing window: cap the media instance, give the rest to racing
@@ -620,10 +709,27 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
                 c_dl = RACING_NON_RACING_DL_LIMIT
                 c_ul = RACING_NON_RACING_UL_LIMIT
         elif QBT_SPLIT_BETWEEN_INSTANCES and num_instances > 1:
-            # Split DL and UL independently. 0 (unlimited) stays unlimited;
-            # positive budgets are divided evenly between instances.
-            c_dl = 0 if dl_bytes == 0 else max(dl_bytes // num_instances, MIN_QBT_DL_BYTES)
-            c_ul = 0 if ul_bytes == 0 else max(ul_bytes // num_instances, MIN_QBT_UL_BYTES)
+            if dynamic_split_active:
+                # Give active instances their full share; idle instances get
+                # MIN as a holding floor (they'll be re-evaluated next cycle).
+                if dl_bytes == 0:
+                    c_dl = 0
+                elif is_dl_active:
+                    c_dl = max(dl_bytes // dl_active_n, MIN_QBT_DL_BYTES)
+                else:
+                    c_dl = MIN_QBT_DL_BYTES
+
+                if ul_bytes == 0:
+                    c_ul = 0
+                elif is_ul_active:
+                    c_ul = max(ul_bytes // ul_active_n, MIN_QBT_UL_BYTES)
+                else:
+                    c_ul = MIN_QBT_UL_BYTES
+            else:
+                # Static equal split. 0 (unlimited) stays unlimited;
+                # positive budgets are divided evenly between instances.
+                c_dl = 0 if dl_bytes == 0 else max(dl_bytes // num_instances, MIN_QBT_DL_BYTES)
+                c_ul = 0 if ul_bytes == 0 else max(ul_bytes // num_instances, MIN_QBT_UL_BYTES)
         else:
             c_dl, c_ul = dl_bytes, ul_bytes
 
@@ -631,6 +737,13 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
         if racing_active and num_instances > 1:
             is_racer = client_port == RACING_INSTANCE_PORT
             extra = " [RACING]" if is_racer else " [CAPPED]"
+        elif dynamic_split_active:
+            if not is_dl_active and not is_ul_active:
+                extra = " [IDLE]"
+            elif not is_dl_active:
+                extra = " [IDLE-DL]"
+            elif not is_ul_active:
+                extra = " [IDLE-UL]"
 
         if DRY_RUN:
             log.info("[DRY-RUN] [%s] %s%s: dl=%s ul=%s%s", label, client.base, extra,
@@ -653,6 +766,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
     last_ul_limit = ul_bytes
     last_racing_active = racing_active
     last_detail = detail
+    last_activity = activity
 
 # ---------------------------------------------------------------------------
 # Limit calculation
@@ -791,8 +905,9 @@ def main():
              QBT_HEADROOM_FRACTION, QBT_UPLOAD_FRACTION,
              STREAM_OVERHEAD_FACTOR, _fmt_speed(MIN_QBT_DL_BYTES),
              _fmt_speed(MIN_QBT_UL_BYTES))
-    log.info("  Unreachable=%s  ramp_steps=%d  split=%s",
-             UNREACHABLE_ACTION, RAMP_UP_STEPS, QBT_SPLIT_BETWEEN_INSTANCES)
+    log.info("  Unreachable=%s  ramp_steps=%d  split=%s%s",
+             UNREACHABLE_ACTION, RAMP_UP_STEPS, QBT_SPLIT_BETWEEN_INSTANCES,
+             " (dynamic)" if QBT_DYNAMIC_SPLIT else "")
     if RACING_WINDOW_ENABLED:
         log.info("Racing window enabled: %02d:00–%02d:00, racing port=%d, "
                  "media cap DL=%.1f MB/s UL=%.1f MB/s",

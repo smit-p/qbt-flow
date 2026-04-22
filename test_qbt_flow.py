@@ -235,8 +235,10 @@ class TestApplyLimits(unittest.TestCase):
         m.last_ul_limit = None
         m.last_racing_active = None
         m.last_detail = None
+        m.last_activity = {}
         m.DRY_RUN = False
         m.QBT_SPLIT_BETWEEN_INSTANCES = True
+        m.QBT_DYNAMIC_SPLIT = False
         m.RACING_WINDOW_ENABLED = False
         m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024
         m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024
@@ -246,7 +248,9 @@ class TestApplyLimits(unittest.TestCase):
         m.last_ul_limit = None
         m.last_racing_active = None
         m.last_detail = None
+        m.last_activity = {}
         m.DRY_RUN = False
+        m.QBT_DYNAMIC_SPLIT = False
         m.RACING_WINDOW_ENABLED = False
 
     def _make_client(self, success=True):
@@ -496,6 +500,249 @@ class TestQbtClientSetSpeedLimits(unittest.TestCase):
             c = self._make_client()
             ok = c.set_speed_limits(1024, 512)
         self.assertFalse(ok)
+
+
+# ---------------------------------------------------------------------------
+# QbtClient._get_json  /  get_torrent_activity
+# ---------------------------------------------------------------------------
+
+class TestQbtClientGetJson(unittest.TestCase):
+    def _make_client(self):
+        c = m.QbtClient("localhost", 8080, "admin", "password")
+        c.cookie = "SID=existing"
+        return c
+
+    def test_success_returns_parsed_json(self):
+        body = json.dumps([{"name": "torrent1"}, {"name": "torrent2"}]).encode()
+        with patch("qbt_flow.urlopen", return_value=_make_response(body)):
+            c = self._make_client()
+            result = c._get_json("/api/v2/torrents/info?filter=downloading")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["name"], "torrent1")
+
+    def test_empty_list_returns_empty_list(self):
+        body = json.dumps([]).encode()
+        with patch("qbt_flow.urlopen", return_value=_make_response(body)):
+            c = self._make_client()
+            result = c._get_json("/api/v2/torrents/info?filter=downloading")
+        self.assertEqual(result, [])
+
+    def test_urlerror_returns_none(self):
+        with patch("qbt_flow.urlopen", side_effect=URLError("timeout")):
+            c = self._make_client()
+            result = c._get_json("/api/v2/torrents/info?filter=downloading")
+        self.assertIsNone(result)
+
+    def test_auth_expired_relogs_and_retries(self):
+        """403 HTTPError triggers re-login and a second attempt."""
+        err_403 = HTTPError("", 403, "Forbidden", Message(), None)
+        login_resp = _make_response(b"Ok", headers={"Set-Cookie": "SID=newtoken; Path=/"})
+        body = json.dumps([{"name": "t"}]).encode()
+        success_resp = _make_response(body)
+        with patch("qbt_flow.urlopen", side_effect=[err_403, login_resp, success_resp]):
+            c = self._make_client()
+            result = c._get_json("/api/v2/torrents/info?filter=downloading")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(c.cookie, "SID=newtoken")
+
+    def test_403_retry_also_fails_returns_none(self):
+        err_403 = HTTPError("", 403, "Forbidden", Message(), None)
+        login_resp = _make_response(b"Ok", headers={"Set-Cookie": "SID=newtoken; Path=/"})
+        with patch("qbt_flow.urlopen", side_effect=[err_403, login_resp, URLError("still broken")]):
+            c = self._make_client()
+            result = c._get_json("/api/v2/torrents/info?filter=downloading")
+        self.assertIsNone(result)
+
+
+class TestQbtClientGetTorrentActivity(unittest.TestCase):
+    def _make_client(self):
+        c = m.QbtClient("localhost", 8080, "admin", "password")
+        c.cookie = "SID=existing"
+        return c
+
+    def test_returns_counts_when_both_queries_succeed(self):
+        dl_body = json.dumps([{"name": "a"}, {"name": "b"}]).encode()
+        ul_body = json.dumps([{"name": "c"}]).encode()
+        responses = [_make_response(dl_body), _make_response(ul_body)]
+        with patch("qbt_flow.urlopen", side_effect=responses):
+            c = self._make_client()
+            result = c.get_torrent_activity()
+        self.assertEqual(result, (2, 1))
+
+    def test_returns_none_when_dl_query_fails(self):
+        with patch("qbt_flow.urlopen", side_effect=URLError("timeout")):
+            c = self._make_client()
+            result = c.get_torrent_activity()
+        self.assertIsNone(result)
+
+    def test_returns_none_when_ul_query_fails(self):
+        dl_body = json.dumps([]).encode()
+        dl_resp = _make_response(dl_body)
+        with patch("qbt_flow.urlopen", side_effect=[dl_resp, URLError("timeout")]):
+            c = self._make_client()
+            result = c.get_torrent_activity()
+        self.assertIsNone(result)
+
+    def test_returns_zero_zero_when_no_active_torrents(self):
+        dl_body = json.dumps([]).encode()
+        ul_body = json.dumps([]).encode()
+        with patch("qbt_flow.urlopen", side_effect=[_make_response(dl_body), _make_response(ul_body)]):
+            c = self._make_client()
+            result = c.get_torrent_activity()
+        self.assertEqual(result, (0, 0))
+
+
+# ---------------------------------------------------------------------------
+# apply_limits — dynamic split
+# ---------------------------------------------------------------------------
+
+class TestApplyLimitsDynamic(unittest.TestCase):
+    """Tests for QBT_DYNAMIC_SPLIT behaviour."""
+
+    def setUp(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.last_detail = None
+        m.last_activity = {}
+        m.DRY_RUN = False
+        m.QBT_SPLIT_BETWEEN_INSTANCES = True
+        m.QBT_DYNAMIC_SPLIT = True
+        m.RACING_WINDOW_ENABLED = False
+        m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024
+        m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024
+
+    def tearDown(self):
+        m.last_dl_limit = None
+        m.last_ul_limit = None
+        m.last_racing_active = None
+        m.last_detail = None
+        m.last_activity = {}
+        m.DRY_RUN = False
+        m.QBT_DYNAMIC_SPLIT = False
+        m.RACING_WINDOW_ENABLED = False
+
+    def _make_client(self, port=8080, dl_count=0, ul_count=0, activity_ok=True):
+        client = MagicMock()
+        client.ensure_logged_in.return_value = True
+        client.set_speed_limits.return_value = True
+        client.base = f"http://localhost:{port}"
+        client.cookie = "SID=test"
+        if activity_ok:
+            client.get_torrent_activity.return_value = (dl_count, ul_count)
+        else:
+            client.get_torrent_activity.return_value = None  # simulates failure
+        return client
+
+    def test_active_instance_gets_full_dl_budget(self):
+        """When one instance is downloading and the other is idle,
+        the active one should get the full DL budget."""
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        active = self._make_client(8080, dl_count=3, ul_count=1)
+        idle   = self._make_client(8081, dl_count=0, ul_count=0)
+        with patch.object(m, 'clients', [active, idle]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        # Active instance gets full DL budget (1 active instance)
+        active.set_speed_limits.assert_called_once_with(dl, ul)
+        # Idle instance gets the MIN floor
+        idle.set_speed_limits.assert_called_once_with(m.MIN_QBT_DL_BYTES, m.MIN_QBT_UL_BYTES)
+
+    def test_both_active_splits_equally(self):
+        """When both instances have active downloads, budget is split 50/50."""
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        c1 = self._make_client(8080, dl_count=2, ul_count=2)
+        c2 = self._make_client(8081, dl_count=1, ul_count=1)
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        c1.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
+        c2.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
+
+    def test_dl_idle_ul_active_handled_independently(self):
+        """DL and UL activity are independent: an instance can be idle for DL
+        but still seeding (active UL) and vice-versa."""
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        # c1: only downloading, not seeding
+        c1 = self._make_client(8080, dl_count=1, ul_count=0)
+        # c2: only seeding, not downloading
+        c2 = self._make_client(8081, dl_count=0, ul_count=3)
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        # DL: only c1 is active → c1 gets full DL, c2 gets MIN
+        # UL: only c2 is active → c2 gets full UL, c1 gets MIN
+        c1_args = c1.set_speed_limits.call_args[0]
+        c2_args = c2.set_speed_limits.call_args[0]
+        self.assertEqual(c1_args[0], dl)              # c1 DL = full budget
+        self.assertEqual(c1_args[1], m.MIN_QBT_UL_BYTES)  # c1 UL = floor
+        self.assertEqual(c2_args[0], m.MIN_QBT_DL_BYTES)  # c2 DL = floor
+        self.assertEqual(c2_args[1], ul)              # c2 UL = full budget
+
+    def test_all_idle_falls_back_to_equal_split(self):
+        """When all instances are idle (0 torrents), treat all as active so
+        limits are still applied without locking everyone at the floor."""
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        c1 = self._make_client(8080, dl_count=0, ul_count=0)
+        c2 = self._make_client(8081, dl_count=0, ul_count=0)
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        # Falls back to equal split
+        c1.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
+        c2.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
+
+    def test_query_failure_treats_instance_as_active(self):
+        """If get_torrent_activity returns None (API error), the instance is
+        treated as active (fail-open) and gets its share of the budget."""
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        c1 = self._make_client(8080, activity_ok=False)  # query fails
+        c2 = self._make_client(8081, dl_count=1, ul_count=1)
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(dl, ul, "THROTTLE")
+        # Both treated as active → 50/50 split
+        c1.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
+        c2.set_speed_limits.assert_called_once_with(dl // 2, ul // 2)
+
+    def test_activity_change_triggers_reapply_when_budget_unchanged(self):
+        """If the budget doesn't change but an instance transitions from idle
+        to active, limits must be re-applied (not skipped by tolerance check)."""
+        dl = 100 * 1024 * 1024
+        ul = 50 * 1024 * 1024
+        c1 = self._make_client(8080, dl_count=1, ul_count=1)
+        c2 = self._make_client(8081, dl_count=0, ul_count=0)
+
+        # First call: both active=True for c1, idle for c2
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(dl, ul, "THROTTLE")
+
+        # Reset call counts; now c2 becomes active
+        c1.set_speed_limits.reset_mock()
+        c2.set_speed_limits.reset_mock()
+        c2.get_torrent_activity.return_value = (2, 2)  # c2 now active
+        m.last_dl_limit = dl
+        m.last_ul_limit = ul
+        m.last_detail = "THROTTLE"
+
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(dl, ul, "THROTTLE")
+
+        # Re-apply should have happened (both now 50/50)
+        c1.set_speed_limits.assert_called_once()
+        c2.set_speed_limits.assert_called_once()
+
+    def test_unlimited_dl_stays_unlimited_for_active_instance(self):
+        """0 DL budget (unlimited) should pass through as 0 for active instances."""
+        ul = 50 * 1024 * 1024
+        c1 = self._make_client(8080, dl_count=2, ul_count=1)
+        c2 = self._make_client(8081, dl_count=0, ul_count=0)
+        with patch.object(m, 'clients', [c1, c2]):
+            m.apply_limits(0, ul, "THROTTLE")
+        # c1 active: DL=0 (unlimited), UL=full budget
+        c1.set_speed_limits.assert_called_once_with(0, ul)
+        # c2 idle: DL=0 (unlimited, 0 passes through), UL=MIN
+        c2.set_speed_limits.assert_called_once_with(0, m.MIN_QBT_UL_BYTES)
 
 
 # ---------------------------------------------------------------------------
