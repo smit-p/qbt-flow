@@ -411,6 +411,14 @@ class TestQbtClientLogin(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(c.cookie, "SID=abc123")
 
+    def test_login_extracts_qbt_sid_cookie_v42(self):
+        resp = _make_response(b"Ok", headers={"Set-Cookie": "QBT_SID_=xyz789; Path=/; HttpOnly; SameSite=Strict"})
+        with patch("qbt_flow.urlopen", return_value=resp):
+            c = self._make_client()
+            ok = c.login()
+        self.assertTrue(ok)
+        self.assertEqual(c.cookie, "QBT_SID_=xyz789")
+
     def test_login_fails_when_no_sid_in_response(self):
         resp = _make_response(b"Ok", headers={"Set-Cookie": "Path=/"})
         with patch("qbt_flow.urlopen", return_value=resp):
