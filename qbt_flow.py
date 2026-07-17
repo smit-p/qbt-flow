@@ -223,15 +223,18 @@ QBT_DYNAMIC_SPLIT = _env("QBT_DYNAMIC_SPLIT", "false").lower() in ("true", "1", 
 # stalled-state torrents.
 QBT_ACTIVE_DL_THRESHOLD = int(_env_speed("QBT_ACTIVE_DL_THRESHOLD", 0))  # bytes/sec
 QBT_ACTIVE_UL_THRESHOLD = int(_env_speed("QBT_ACTIVE_UL_THRESHOLD", 0))  # bytes/sec
-# Warn if the env var was explicitly set but couldn't be parsed (unrecognised suffix).
+# Warn if the env var was explicitly set but couldn't be parsed (unrecognised
+# suffix).  The logger isn't configured yet at this point in module load, so
+# collect the warnings and emit them once `log` exists (see the Logging block).
+_config_warnings = []
 for _thr_key, _thr_val in (("QBT_ACTIVE_DL_THRESHOLD", QBT_ACTIVE_DL_THRESHOLD),
                             ("QBT_ACTIVE_UL_THRESHOLD", QBT_ACTIVE_UL_THRESHOLD)):
     _raw = os.environ.get(_thr_key, "")
     if _raw and _raw.strip() not in ("0", "") and _thr_val == 0:
-        log.warning(
+        _config_warnings.append(
             "Config warning: %s=%r could not be parsed — treating as 0 "
-            "(unrecognised suffix?). Use formats like '500KB', '1MB/s', '500000'.",
-            _thr_key, _raw,
+            "(unrecognised suffix?). Use formats like '500KB', '1MB/s', '500000'."
+            % (_thr_key, _raw)
         )
 del _thr_key, _thr_val, _raw
 
@@ -297,6 +300,11 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("qbt_flow")
+
+# Flush any config warnings collected before the logger was ready.
+for _msg in _config_warnings:
+    log.warning("%s", _msg)
+del _config_warnings
 
 # ---------------------------------------------------------------------------
 # State

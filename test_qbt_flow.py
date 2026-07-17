@@ -1469,6 +1469,36 @@ class TestMain(unittest.TestCase):
 # load_env
 # ---------------------------------------------------------------------------
 
+class TestConfigWarningStartup(unittest.TestCase):
+    """Regression: an unparseable QBT_ACTIVE_*_THRESHOLD used to crash at import
+    time with `NameError: name 'log' is not defined`, because the warning was
+    emitted before the logger was constructed."""
+
+    def _import_with(self, env_extra):
+        import subprocess
+        env = dict(os.environ)
+        env["QBT_INSTANCES"] = "localhost:8080:admin:pass"
+        env["LOG_FILE"] = os.devnull
+        env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, "-c", "import qbt_flow"],
+            cwd=str(Path(m.__file__).parent),
+            env=env, capture_output=True, text=True,
+        )
+
+    def test_unparseable_threshold_does_not_crash(self):
+        result = self._import_with({"QBT_ACTIVE_DL_THRESHOLD": "banana"})
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertNotIn("NameError", result.stderr)
+        # The warning must still be surfaced.
+        self.assertIn("could not be parsed", result.stderr + result.stdout)
+
+    def test_valid_threshold_imports_cleanly(self):
+        result = self._import_with({"QBT_ACTIVE_DL_THRESHOLD": "500KB"})
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertNotIn("could not be parsed", result.stderr + result.stdout)
+
+
 class TestLoadEnv(unittest.TestCase):
     def test_load_env_skips_comments_and_blanks(self):
         from unittest.mock import mock_open
