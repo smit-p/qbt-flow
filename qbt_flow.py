@@ -203,6 +203,13 @@ QBT_UPLOAD_FRACTION   = _env_float("QBT_UPLOAD_FRACTION",   0.9)
 # If true, each instance gets (total / N). If false, each gets the full amount.
 QBT_SPLIT_BETWEEN_INSTANCES = _env("QBT_SPLIT_BETWEEN_INSTANCES", "true").lower() in ("true", "1", "yes")
 
+# When true, if an instance has qBittorrent's *alternative* speed limits toggled
+# on, qbt-flow leaves that instance's limits untouched for the cycle.  This lets
+# you manually switch an instance into a hard-throttled state (via the qBt UI or
+# scheduler) without qbt-flow overwriting the values you set.  Default off to
+# preserve existing behaviour.
+QBT_RESPECT_ALT_LIMITS = _env("QBT_RESPECT_ALT_LIMITS", "false").lower() in ("true", "1", "yes")
+
 # Dynamic split: query each qBt instance for active torrent counts and give the
 # full budget only to instances that are actively downloading/seeding.  Idle
 # instances receive the hard floor (MIN_QBT_DL / MIN_QBT_UL) as a holding cap.
@@ -300,6 +307,7 @@ last_ul_limit = None
 last_racing_active = None
 last_detail = None
 last_activity: dict = {}   # id(client) -> (dl_count: int, ul_count: int)
+last_alt_skipped = False   # True if any instance was skipped for active alt limits last cycle
 
 _start_time = 0.0
 _status = {
@@ -626,6 +634,20 @@ class QbtClient:
             log.warning("qbt %s GET %s failed: %s", self.base, path, e)
             return None
 
+    def is_alt_limits_active(self):
+        """
+        Return True if qBittorrent's alternative speed limits are currently
+        enabled for this instance.  Used to leave the user's manually-toggled
+        alt limits untouched when QBT_RESPECT_ALT_LIMITS is on.
+
+        The endpoint returns the bare text "1" (enabled) or "0" (disabled),
+        both of which parse cleanly as JSON.  On any query failure we return
+        False (fail-open) so limits are still applied rather than silently
+        skipped.
+        """
+        mode = self._get_json("/api/v2/transfer/speedLimitsMode")
+        return mode == 1
+
     def get_torrent_activity(self, dl_threshold=0, ul_threshold=0):
         """
         Returns (dl_count, ul_count): number of torrents that are genuinely
@@ -667,7 +689,7 @@ def _is_racing_window():
 
 
 def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
-    global last_dl_limit, last_ul_limit, last_racing_active, last_detail, last_activity
+    global last_dl_limit, last_ul_limit, last_racing_active, last_detail, last_activity, last_alt_skipped
 
     racing_active = _is_racing_window()
 
@@ -722,7 +744,11 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
 
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
     # But always re-apply when label/detail/activity changes.
-    if not force and last_dl_limit is not None and last_ul_limit is not None:
+    # If an instance was skipped last cycle because its alt limits were active,
+    # never short-circuit: we must re-check and re-push once the user turns those
+    # alt limits off, otherwise the instance would stay on stale limits.
+    if not force and last_dl_limit is not None and last_ul_limit is not None \
+            and not last_alt_skipped:
         dl_diff = abs(dl_bytes - last_dl_limit) / max(last_dl_limit, 1)
         ul_diff = abs(ul_bytes - last_ul_limit) / max(last_ul_limit, 1)
         detail_changed = detail != last_detail
@@ -734,6 +760,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
                       dl_diff * 100, ul_diff * 100)
             return
 
+    alt_skipped = False
     for client in clients:
         client_port = int(client.base.rsplit(":", 1)[-1])
         dl_cnt, ul_cnt = activity[id(client)]
@@ -798,6 +825,11 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
         if not client.ensure_logged_in():
             log.error("qbt %s: login failed, skipping this cycle", client.base)
             continue
+        if QBT_RESPECT_ALT_LIMITS and client.is_alt_limits_active():
+            log.info("[%s] %s%s: alternative speed limits active, leaving limits untouched",
+                     label, client.base, extra)
+            alt_skipped = True
+            continue
         ok = client.set_speed_limits(c_dl, c_ul)
         if ok:
             log.info("[%s] %s%s: dl=%s ul=%s%s", label, client.base, extra,
@@ -812,6 +844,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
     last_racing_active = racing_active
     last_detail = detail
     last_activity = activity
+    last_alt_skipped = alt_skipped
 
 # ---------------------------------------------------------------------------
 # Limit calculation

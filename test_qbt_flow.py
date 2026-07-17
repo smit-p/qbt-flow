@@ -236,9 +236,11 @@ class TestApplyLimits(unittest.TestCase):
         m.last_racing_active = None
         m.last_detail = None
         m.last_activity = {}
+        m.last_alt_skipped = False
         m.DRY_RUN = False
         m.QBT_SPLIT_BETWEEN_INSTANCES = True
         m.QBT_DYNAMIC_SPLIT = False
+        m.QBT_RESPECT_ALT_LIMITS = False
         m.RACING_WINDOW_ENABLED = False
         m.MIN_QBT_DL_BYTES = 10 * 1024 * 1024
         m.MIN_QBT_UL_BYTES =  5 * 1024 * 1024
@@ -249,8 +251,10 @@ class TestApplyLimits(unittest.TestCase):
         m.last_racing_active = None
         m.last_detail = None
         m.last_activity = {}
+        m.last_alt_skipped = False
         m.DRY_RUN = False
         m.QBT_DYNAMIC_SPLIT = False
+        m.QBT_RESPECT_ALT_LIMITS = False
         m.RACING_WINDOW_ENABLED = False
 
     def _make_client(self, success=True):
@@ -393,6 +397,59 @@ class TestApplyLimits(unittest.TestCase):
             m.apply_limits(dl, ul, "THROTTLE")
         self.assertEqual(m.last_dl_limit, dl)
         self.assertEqual(m.last_ul_limit, ul)
+
+    def test_alt_limits_skip_when_respect_enabled(self):
+        """When QBT_RESPECT_ALT_LIMITS is on and alt limits are active,
+        the instance's limits are left untouched."""
+        m.QBT_RESPECT_ALT_LIMITS = True
+        client = self._make_client()
+        client.is_alt_limits_active.return_value = True
+        with patch.object(m, 'clients', [client]):
+            m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE")
+        client.set_speed_limits.assert_not_called()
+        self.assertTrue(m.last_alt_skipped)
+
+    def test_alt_limits_applied_when_inactive(self):
+        """Respect enabled but alt limits off — limits are applied normally."""
+        m.QBT_RESPECT_ALT_LIMITS = True
+        client = self._make_client()
+        client.is_alt_limits_active.return_value = False
+        with patch.object(m, 'clients', [client]):
+            m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE")
+        client.set_speed_limits.assert_called_once_with(50 * 1024 * 1024, 25 * 1024 * 1024)
+        self.assertFalse(m.last_alt_skipped)
+
+    def test_alt_limits_not_checked_when_respect_disabled(self):
+        """Default behaviour: alt-limit state is never queried."""
+        m.QBT_RESPECT_ALT_LIMITS = False
+        client = self._make_client()
+        with patch.object(m, 'clients', [client]):
+            m.apply_limits(50 * 1024 * 1024, 25 * 1024 * 1024, "THROTTLE")
+        client.is_alt_limits_active.assert_not_called()
+        client.set_speed_limits.assert_called_once()
+
+    def test_alt_skip_forces_reapply_next_cycle(self):
+        """After an alt-limit skip, the tolerance check must not short-circuit
+        the next cycle, so a re-push happens once alt limits are turned off."""
+        m.QBT_RESPECT_ALT_LIMITS = True
+        dl = 50 * 1024 * 1024
+        ul = 25 * 1024 * 1024
+        # Cycle 1: alt limits active -> skipped, nothing set.
+        client = self._make_client()
+        client.is_alt_limits_active.return_value = True
+        with patch.object(m, 'clients', [client]):
+            m.apply_limits(dl, ul, "THROTTLE",
+                           detail="1 stream(s), using ~5 Mbps")
+        self.assertTrue(m.last_alt_skipped)
+        # Cycle 2: same budget/detail but alt limits now off. Despite the
+        # unchanged budget, limits must be re-pushed (not skipped by tolerance).
+        client2 = self._make_client()
+        client2.is_alt_limits_active.return_value = False
+        with patch.object(m, 'clients', [client2]):
+            m.apply_limits(dl, ul, "THROTTLE",
+                           detail="1 stream(s), using ~5 Mbps")
+        client2.set_speed_limits.assert_called_once_with(dl, ul)
+        self.assertFalse(m.last_alt_skipped)
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +617,29 @@ class TestQbtClientGetJson(unittest.TestCase):
             c = self._make_client()
             result = c._get_json("/api/v2/torrents/info?filter=downloading")
         self.assertIsNone(result)
+
+
+class TestQbtClientAltLimitsActive(unittest.TestCase):
+    def _make_client(self):
+        c = m.QbtClient("localhost", 8080, "admin", "password")
+        c.cookie = "SID=existing"
+        return c
+
+    def test_returns_true_when_mode_is_one(self):
+        resp = _make_response(b"1")
+        with patch("qbt_flow.urlopen", return_value=resp):
+            self.assertTrue(self._make_client().is_alt_limits_active())
+
+    def test_returns_false_when_mode_is_zero(self):
+        resp = _make_response(b"0")
+        with patch("qbt_flow.urlopen", return_value=resp):
+            self.assertFalse(self._make_client().is_alt_limits_active())
+
+    def test_returns_false_on_query_failure(self):
+        """Fail-open: an unreachable/erroring instance must not be treated
+        as having alt limits active (limits still get applied)."""
+        with patch("qbt_flow.urlopen", side_effect=URLError("boom")):
+            self.assertFalse(self._make_client().is_alt_limits_active())
 
 
 class TestQbtClientGetTorrentActivity(unittest.TestCase):
@@ -1466,6 +1546,19 @@ class TestBackoffTracker(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestJellyfinEmbySessions(unittest.TestCase):
+    def setUp(self):
+        # These fetchers read the module-level URL/token globals, which are
+        # empty unless a config.env is present. Set them explicitly so the
+        # tests build a valid absolute request URL in any environment.
+        self._saved = (m.JELLYFIN_URL, m.JELLYFIN_TOKEN, m.EMBY_URL, m.EMBY_TOKEN)
+        m.JELLYFIN_URL = "http://jellyfin.local:8096"
+        m.JELLYFIN_TOKEN = "test-token"
+        m.EMBY_URL = "http://emby.local:8096"
+        m.EMBY_TOKEN = "test-token"
+
+    def tearDown(self):
+        m.JELLYFIN_URL, m.JELLYFIN_TOKEN, m.EMBY_URL, m.EMBY_TOKEN = self._saved
+
     def test_jellyfin_active_session(self):
         data = json.dumps([
             {
