@@ -150,6 +150,24 @@ class TestParseSpeed(unittest.TestCase):
     def test_unrecognised_suffix_returns_zero(self):
         self.assertEqual(m._parse_speed("10xyz"), 0)
 
+    # -- as_bits: byte-suffixed totals normalise to bits (bug fix) --
+    def test_as_bits_converts_byte_suffix(self):
+        # 125 MB/s == 125 * 1024^2 bytes/s == that * 8 bits/s ≈ 1 Gbps
+        self.assertEqual(m._parse_speed("125MB/s", as_bits=True), 125 * 1024 * 1024 * 8)
+
+    def test_as_bits_leaves_bit_suffix_untouched(self):
+        self.assertEqual(m._parse_speed("1Gbps", as_bits=True), 1_000_000_000)
+
+    def test_as_bits_leaves_plain_number_untouched(self):
+        # Plain numbers are already bits/sec by contract.
+        self.assertEqual(m._parse_speed("1000000000", as_bits=True), 1_000_000_000)
+
+    def test_byte_and_bit_totals_are_equivalent(self):
+        # The README lists these as equivalent ways to say ~1 Gbps.
+        gbps = m._parse_speed("1Gbps", as_bits=True)
+        mbs = m._parse_speed("125MB/s", as_bits=True)
+        self.assertAlmostEqual(mbs / gbps, 1.0, delta=0.05)
+
 
 class TestEnvSpeed(unittest.TestCase):
     """Verify _env_speed reads key and falls back to default."""

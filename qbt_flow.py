@@ -80,13 +80,26 @@ _SPEED_MULTIPLIERS = {
     "b": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3,
 }
 _SPEED_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z/]+)\s*$")
+# Suffixes that denote *bytes*/sec (as opposed to bits/sec).  Used to normalise
+# byte-denominated values to bits when a caller needs bits (see `as_bits`).
+_BYTE_SPEED_SUFFIXES = frozenset({"b/s", "kb/s", "mb/s", "gb/s", "b", "kb", "mb", "gb"})
 
-def _parse_speed(raw):
+def _parse_speed(raw, as_bits=False):
     """Parse a human-readable speed value into a number.
 
     Accepts plain numbers (returned as-is) or numbers with a suffix:
       Bits/sec:  Kbps, Mbps, Gbps   (e.g. "1Gbps" → 1 000 000 000)
       Bytes/sec: KB/s, MB/s, GB/s   (e.g. "10MB/s" → 10 485 760)
+
+    By default the return unit follows the suffix: bits for bit-suffixes,
+    bytes for byte-suffixes, and plain numbers pass through unchanged.  This is
+    fine for byte-denominated settings (MIN_QBT_*, thresholds, racing caps).
+
+    Pass ``as_bits=True`` for bandwidth *totals* (TOTAL_BANDWIDTH / TOTAL_UPLOAD),
+    which are consumed as bits/sec: a byte-suffixed value (e.g. "125MB/s") is
+    then multiplied by 8 so it means the same as its bit equivalent ("1Gbps").
+    Without this, "125MB/s" would be read as ~131 Mbit and silently give ~8x
+    less bandwidth than the docs claim it's equivalent to.
     """
     if isinstance(raw, (int, float)):
         return raw
@@ -99,18 +112,21 @@ def _parse_speed(raw):
         suffix = m.group(2).lower()
         mult = _SPEED_MULTIPLIERS.get(suffix)
         if mult is not None:
-            return number * mult
+            value = number * mult
+            if as_bits and suffix in _BYTE_SPEED_SUFFIXES:
+                value *= 8  # bytes/sec → bits/sec
+            return value
     # Plain number or unrecognised suffix — fall through to float()
     try:
         return float(raw)
     except ValueError:
         return 0
 
-def _env_speed(key, default):
+def _env_speed(key, default, as_bits=False):
     """Read a speed env-var, returning *default* if unset."""
     val = os.environ.get(key)
     if val is not None:
-        return _parse_speed(val)
+        return _parse_speed(val, as_bits=as_bits)
     return default
 
 # Size-suffix multipliers (for file sizes — base-1024)
@@ -187,10 +203,11 @@ def _parse_qbt_instances():
 QBT_INSTANCES = _parse_qbt_instances()
 
 # Your line speed (download).  Accepts plain numbers (bits/sec) or suffixes:
-#   1Gbps, 500Mbps, 100Mbps, etc.
-TOTAL_BANDWIDTH_BPS   = _env_speed("TOTAL_BANDWIDTH", 1_000_000_000)  # 1 Gbps
+#   1Gbps, 500Mbps, 100Mbps (bits) or 125MB/s (bytes — normalised to bits).
+# These totals are consumed as bits/sec, so parse with as_bits=True.
+TOTAL_BANDWIDTH_BPS   = _env_speed("TOTAL_BANDWIDTH", 1_000_000_000, as_bits=True)  # 1 Gbps
 # Upload line speed — defaults to TOTAL_BANDWIDTH if not set
-TOTAL_UPLOAD_BPS      = _env_speed("TOTAL_UPLOAD", TOTAL_BANDWIDTH_BPS)
+TOTAL_UPLOAD_BPS      = _env_speed("TOTAL_UPLOAD", TOTAL_BANDWIDTH_BPS, as_bits=True)
 
 # Fraction of remaining bandwidth (after media streams) to give qBittorrent.
 # Download defaults to 1.0 (no throttling) because media streams use upload,
