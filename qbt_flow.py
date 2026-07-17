@@ -333,6 +333,7 @@ last_racing_active = None
 last_detail = None
 last_activity: dict = {}   # id(client) -> (dl_count: int, ul_count: int)
 last_alt_skipped = False   # True if any instance was skipped for active alt limits last cycle
+last_apply_failed = False  # True if any instance failed login/set last cycle (retry must not be skipped)
 
 _start_time = 0.0
 _status = {
@@ -714,7 +715,8 @@ def _is_racing_window():
 
 
 def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
-    global last_dl_limit, last_ul_limit, last_racing_active, last_detail, last_activity, last_alt_skipped
+    global last_dl_limit, last_ul_limit, last_racing_active, last_detail, last_activity, \
+        last_alt_skipped, last_apply_failed
 
     racing_active = _is_racing_window()
 
@@ -769,11 +771,12 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
 
     # Skip if limits haven't changed meaningfully (within 1% tolerance)
     # But always re-apply when label/detail/activity changes.
-    # If an instance was skipped last cycle because its alt limits were active,
-    # never short-circuit: we must re-check and re-push once the user turns those
-    # alt limits off, otherwise the instance would stay on stale limits.
+    # If an instance was skipped last cycle (active alt limits) or failed
+    # (login/set error), never short-circuit: the promised retry / re-push must
+    # actually happen, otherwise the instance would stay on stale limits until
+    # the budget happened to drift by >1%.
     if not force and last_dl_limit is not None and last_ul_limit is not None \
-            and not last_alt_skipped:
+            and not last_alt_skipped and not last_apply_failed:
         dl_diff = abs(dl_bytes - last_dl_limit) / max(last_dl_limit, 1)
         ul_diff = abs(ul_bytes - last_ul_limit) / max(last_ul_limit, 1)
         detail_changed = detail != last_detail
@@ -786,6 +789,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
             return
 
     alt_skipped = False
+    apply_failed = False
     for client in clients:
         client_port = int(client.base.rsplit(":", 1)[-1])
         dl_cnt, ul_cnt = activity[id(client)]
@@ -849,6 +853,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
             continue
         if not client.ensure_logged_in():
             log.error("qbt %s: login failed, skipping this cycle", client.base)
+            apply_failed = True
             continue
         if QBT_RESPECT_ALT_LIMITS and client.is_alt_limits_active():
             log.info("[%s] %s%s: alternative speed limits active, leaving limits untouched",
@@ -862,6 +867,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
                      f" ({detail})" if detail else "")
         else:
             client.cookie = None
+            apply_failed = True
             log.error("qbt %s: failed to set limits, will retry next cycle", client.base)
 
     last_dl_limit = dl_bytes
@@ -870,6 +876,7 @@ def apply_limits(dl_bytes, ul_bytes, label, detail="", force=False):
     last_detail = detail
     last_activity = activity
     last_alt_skipped = alt_skipped
+    last_apply_failed = apply_failed
 
 # ---------------------------------------------------------------------------
 # Limit calculation

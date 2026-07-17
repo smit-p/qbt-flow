@@ -255,6 +255,7 @@ class TestApplyLimits(unittest.TestCase):
         m.last_detail = None
         m.last_activity = {}
         m.last_alt_skipped = False
+        m.last_apply_failed = False
         m.DRY_RUN = False
         m.QBT_SPLIT_BETWEEN_INSTANCES = True
         m.QBT_DYNAMIC_SPLIT = False
@@ -270,6 +271,7 @@ class TestApplyLimits(unittest.TestCase):
         m.last_detail = None
         m.last_activity = {}
         m.last_alt_skipped = False
+        m.last_apply_failed = False
         m.DRY_RUN = False
         m.QBT_DYNAMIC_SPLIT = False
         m.QBT_RESPECT_ALT_LIMITS = False
@@ -415,6 +417,51 @@ class TestApplyLimits(unittest.TestCase):
             m.apply_limits(dl, ul, "THROTTLE")
         self.assertEqual(m.last_dl_limit, dl)
         self.assertEqual(m.last_ul_limit, ul)
+
+    def test_failed_set_retries_next_cycle_despite_unchanged_limits(self):
+        """Regression: a failed set_speed_limits promised 'will retry next
+        cycle', but the tolerance check used to short-circuit that retry
+        when the budget was steady — leaving the instance unthrottled."""
+        dl = 50 * 1024 * 1024
+        ul = 25 * 1024 * 1024
+        c1 = self._make_client(success=False)
+        with patch.object(m, 'clients', [c1]):
+            m.apply_limits(dl, ul, "THROTTLE", detail="1 stream(s)")
+        self.assertTrue(m.last_apply_failed)
+        # Next cycle: identical budget/detail — retry must still happen.
+        c2 = self._make_client(success=True)
+        with patch.object(m, 'clients', [c2]):
+            m.apply_limits(dl, ul, "THROTTLE", detail="1 stream(s)")
+        c2.set_speed_limits.assert_called_once_with(dl, ul)
+        self.assertFalse(m.last_apply_failed)
+
+    def test_failed_login_retries_next_cycle_despite_unchanged_limits(self):
+        """Same as above for the ensure_logged_in() failure path."""
+        dl = 50 * 1024 * 1024
+        ul = 25 * 1024 * 1024
+        c1 = self._make_client()
+        c1.ensure_logged_in.return_value = False
+        with patch.object(m, 'clients', [c1]):
+            m.apply_limits(dl, ul, "THROTTLE", detail="1 stream(s)")
+        self.assertTrue(m.last_apply_failed)
+        c2 = self._make_client()
+        with patch.object(m, 'clients', [c2]):
+            m.apply_limits(dl, ul, "THROTTLE", detail="1 stream(s)")
+        c2.set_speed_limits.assert_called_once_with(dl, ul)
+        self.assertFalse(m.last_apply_failed)
+
+    def test_successful_apply_still_short_circuits_next_cycle(self):
+        """The tolerance skip must remain intact after a fully successful
+        cycle (no needless API churn)."""
+        dl = 50 * 1024 * 1024
+        ul = 25 * 1024 * 1024
+        c1 = self._make_client()
+        with patch.object(m, 'clients', [c1]):
+            m.apply_limits(dl, ul, "THROTTLE", detail="1 stream(s)")
+        c2 = self._make_client()
+        with patch.object(m, 'clients', [c2]):
+            m.apply_limits(dl, ul, "THROTTLE", detail="1 stream(s)")
+        c2.set_speed_limits.assert_not_called()
 
     def test_alt_limits_skip_when_respect_enabled(self):
         """When QBT_RESPECT_ALT_LIMITS is on and alt limits are active,
