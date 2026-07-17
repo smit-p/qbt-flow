@@ -565,7 +565,7 @@ class QbtClient:
                 set_cookie = resp.headers.get("Set-Cookie", "")
                 for part in set_cookie.split(";"):
                     part = part.strip()
-                    if part.startswith("SID="):
+                    if part.startswith("SID=") or part.startswith("QBT_SID_"):
                         self.cookie = part
                         log.debug("qbt login successful at %s", self.base)
                         return True
