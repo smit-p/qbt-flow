@@ -32,8 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/smit-p/qbt-flow/main/setup.sh | bas
 
 The interactive wizard walks you through:
 
-1. **Media servers** — select Plex / Jellyfin / Emby and enter URLs + tokens
-2. **qBittorrent instances** — add one or more with host, port, and credentials
+1. **Media sources** — select Plex / Jellyfin / Emby / Tautulli and enter URLs + tokens
+2. **Torrent clients** — add qBittorrent and/or Transmission instances (host, port, credentials)
 3. **Bandwidth** — enter your download/upload speeds (e.g. `1Gbps`, `50Mbps`)
 4. **Advanced options** — optionally configure the racing window
 

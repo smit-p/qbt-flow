@@ -74,11 +74,12 @@ add "# Full reference: config.env.example"
 add ""
 
 # ── 1. Media Servers ─────────────────────────────────────────────────────────
-header "1/4" "Media Servers"
-echo -e "  Which media servers do you use?"
+header "1/4" "Media Sources"
+echo -e "  Which media source(s) do you use?"
 echo -e "    ${BOLD}1${RESET}) Plex"
 echo -e "    ${BOLD}2${RESET}) Jellyfin"
 echo -e "    ${BOLD}3${RESET}) Emby"
+echo -e "    ${BOLD}4${RESET}) Tautulli  ${DIM}(aggregates Plex; reports real bandwidth + LAN/WAN)${RESET}"
 echo ""
 servers=$(ask "Enter numbers, e.g. ${BOLD}1 2${RESET}: ")
 
@@ -126,46 +127,100 @@ if has_server 3; then
     add ""
 fi
 
-if ! has_server 1 && ! has_server 2 && ! has_server 3; then
+if has_server 4; then
     echo ""
-    warn "No media server selected — qbt-flow needs at least one."
+    add "# Tautulli"
+    taut_url=$(ask_d "Tautulli URL" "http://localhost:8181")
+    taut_tok=$(ask_s "Tautulli API Key ${DIM}(hidden)${RESET}: ")
+    while [[ -z "$taut_tok" ]]; do
+        warn "API key cannot be empty."
+        taut_tok=$(ask_s "Tautulli API Key ${DIM}(hidden)${RESET}: ")
+    done
+    add "TAUTULLI_URL=$taut_url"
+    add "TAUTULLI_TOKEN=$taut_tok"
+    add ""
+fi
+
+if ! has_server 1 && ! has_server 2 && ! has_server 3 && ! has_server 4; then
+    echo ""
+    warn "No media source selected — qbt-flow needs at least one."
     warn "You can add one later by editing config.env."
-    add "# TODO: add a media server"
+    add "# TODO: add a media source"
     add "#PLEX_URL=http://localhost:32400"
     add "#PLEX_TOKEN="
     add ""
 fi
 
-# ── 2. qBittorrent ──────────────────────────────────────────────────────────
-header "2/4" "qBittorrent Instances"
+# ── 2. Torrent clients ──────────────────────────────────────────────────────
+header "2/4" "Torrent Clients"
 qbt_instances=""
-n=1
-while true; do
-    echo -e "  ${BOLD}Instance $n${RESET}"
-    qbt_host=$(ask_d "  Host" "localhost")
-    qbt_port=$(ask_d "  Port" "8080")
-    qbt_user=$(ask_d "  Username" "admin")
-    qbt_pass=$(ask_s "  Password ${DIM}(hidden)${RESET}: ")
-    while [[ -z "$qbt_pass" ]]; do
-        warn "  Password cannot be empty."
+trans_instances=""
+
+if confirm "Configure qBittorrent instance(s)?"; then
+    n=1
+    while true; do
+        echo -e "  ${BOLD}qBittorrent instance $n${RESET}"
+        qbt_host=$(ask_d "  Host" "localhost")
+        qbt_port=$(ask_d "  Port" "8080")
+        qbt_user=$(ask_d "  Username" "admin")
         qbt_pass=$(ask_s "  Password ${DIM}(hidden)${RESET}: ")
+        while [[ -z "$qbt_pass" ]]; do
+            warn "  Password cannot be empty."
+            qbt_pass=$(ask_s "  Password ${DIM}(hidden)${RESET}: ")
+        done
+
+        entry="${qbt_host}:${qbt_port}:${qbt_user}:${qbt_pass}"
+        if confirm_n "  Uses HTTPS?"; then
+            entry+=":https"
+        fi
+
+        [[ -n "$qbt_instances" ]] && qbt_instances+=","
+        qbt_instances+="$entry"
+        ((n++))
+        echo ""
+        confirm_n "Add another qBittorrent instance?" || break
+        echo ""
     done
+fi
 
-    entry="${qbt_host}:${qbt_port}:${qbt_user}:${qbt_pass}"
-    if confirm_n "  Uses HTTPS?"; then
-        entry+=":https"
-    fi
+echo ""
+if confirm_n "Configure Transmission instance(s)?"; then
+    n=1
+    while true; do
+        echo -e "  ${BOLD}Transmission instance $n${RESET}"
+        tr_host=$(ask_d "  Host" "localhost")
+        tr_port=$(ask_d "  Port" "9091")
+        tr_user=$(ask "  Username ${DIM}(blank if RPC auth is off)${RESET}: ")
+        tr_pass=""
+        [[ -n "$tr_user" ]] && tr_pass=$(ask_s "  Password ${DIM}(hidden)${RESET}: ")
 
-    [[ -n "$qbt_instances" ]] && qbt_instances+=","
-    qbt_instances+="$entry"
-    ((n++))
-    echo ""
-    confirm_n "Add another instance?" || break
-    echo ""
-done
+        entry="${tr_host}:${tr_port}:${tr_user}:${tr_pass}"
+        if confirm_n "  Uses HTTPS?"; then
+            entry+=":https"
+        fi
 
-add "# qBittorrent"
-add "QBT_INSTANCES=$qbt_instances"
+        [[ -n "$trans_instances" ]] && trans_instances+=","
+        trans_instances+="$entry"
+        ((n++))
+        echo ""
+        confirm_n "Add another Transmission instance?" || break
+        echo ""
+    done
+fi
+
+add "# Torrent clients"
+if [[ -n "$qbt_instances" ]]; then
+    add "QBT_INSTANCES=$qbt_instances"
+fi
+if [[ -n "$trans_instances" ]]; then
+    add "TRANSMISSION_INSTANCES=$trans_instances"
+fi
+if [[ -z "$qbt_instances" && -z "$trans_instances" ]]; then
+    warn "No torrent client configured — qbt-flow needs at least one."
+    warn "Add one later by editing config.env."
+    add "# TODO: add a torrent client"
+    add "#QBT_INSTANCES=localhost:8080:admin:yourpassword"
+fi
 add ""
 
 # ── 3. Bandwidth ────────────────────────────────────────────────────────────
@@ -174,8 +229,8 @@ echo -e "  ${DIM}Supports suffixes: 1Gbps, 500Mbps, 100MB/s, etc.${RESET}"
 echo ""
 bw_dl=$(ask_d "Download speed" "1Gbps")
 bw_ul=$(ask "Upload speed ${DIM}(blank = same as download)${RESET}: ")
-min_dl=$(ask_d "Min qBittorrent download floor" "10MB/s")
-min_ul=$(ask_d "Min qBittorrent upload floor" "5MB/s")
+min_dl=$(ask_d "Min torrent download floor" "10MB/s")
+min_ul=$(ask_d "Min torrent upload floor" "5MB/s")
 
 add "# Bandwidth"
 add "TOTAL_BANDWIDTH=$bw_dl"
