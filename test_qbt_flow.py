@@ -952,10 +952,56 @@ class TestApplyLimitsDynamic(unittest.TestCase):
 # get_plex_sessions
 # ---------------------------------------------------------------------------
 
+class TestClientIsLan(unittest.TestCase):
+    def test_rfc1918_is_lan(self):
+        for ip in ("192.168.1.5", "10.0.0.9", "172.16.4.4", "172.31.255.1"):
+            self.assertTrue(m._client_is_lan(ip), ip)
+
+    def test_loopback_and_link_local_are_lan(self):
+        for ip in ("127.0.0.1", "169.254.1.1", "::1", "fe80::1", "fd12::9"):
+            self.assertTrue(m._client_is_lan(ip), ip)
+
+    def test_public_is_not_lan(self):
+        # incl. CGNAT (100.64/10) and documentation (203.0.113/24) — both remote
+        for ip in ("8.8.8.8", "1.1.1.1", "100.64.0.1", "203.0.113.7", "2606:4700::1111"):
+            self.assertFalse(m._client_is_lan(ip), ip)
+
+    def test_strips_port_suffix(self):
+        self.assertTrue(m._client_is_lan("192.168.1.5:34521"))
+        self.assertTrue(m._client_is_lan("[fe80::1]:8096"))
+        self.assertFalse(m._client_is_lan("8.8.8.8:443"))
+
+    def test_empty_or_garbage_is_not_lan(self):
+        for v in ("", None, "garbage", "not-an-ip", "999.999.999.999"):
+            self.assertFalse(m._client_is_lan(v), repr(v))
+
+
 class TestGetPlexSessions(unittest.TestCase):
     def setUp(self):
         m.PLEX_URL   = "http://localhost:32400"
         m.PLEX_TOKEN = "test-token"
+
+    def test_lan_stream_excluded_when_enabled(self):
+        xml = b"""<MediaContainer>
+          <Video title="lan" bitrate="8000"><Player state="playing" local="1" address="192.168.1.5"/></Video>
+          <Video title="wan" bitrate="5000"><Player state="playing" local="0" address="9.9.9.9"/></Video>
+        </MediaContainer>"""
+        m.IGNORE_LAN_STREAMS = True
+        self.addCleanup(setattr, m, "IGNORE_LAN_STREAMS", False)
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
+            count, bps = m.get_plex_sessions()
+        self.assertEqual(count, 1)          # only the WAN stream
+        self.assertEqual(bps, 5_000_000)
+
+    def test_lan_stream_counted_when_disabled(self):
+        xml = b"""<MediaContainer>
+          <Video title="lan" bitrate="8000"><Player state="playing" local="1" address="192.168.1.5"/></Video>
+          <Video title="wan" bitrate="5000"><Player state="playing" local="0" address="9.9.9.9"/></Video>
+        </MediaContainer>"""
+        m.IGNORE_LAN_STREAMS = False
+        with patch("qbt_flow.urlopen", return_value=_make_response(xml)):
+            count, bps = m.get_plex_sessions()
+        self.assertEqual(count, 2)
 
     def test_no_sessions(self):
         xml = b'<?xml version="1.0"?><MediaContainer size="0"></MediaContainer>'
@@ -1421,6 +1467,7 @@ class TestMain(unittest.TestCase):
         m.QBT_INSTANCES = self._orig_inst
         m.DRY_RUN       = self._orig_dry
         m.stop_event.clear()
+        m.wake_event.clear()
 
     @patch("qbt_flow.apply_limits")
     @patch("qbt_flow.get_sessions", return_value=(0, 0))
@@ -1469,8 +1516,9 @@ class TestMain(unittest.TestCase):
         m.QBT_INSTANCES = [("h", 8080, "u", "p", "http")]
         m.UNREACHABLE_ACTION = "keep"
 
-        # Run one iteration then stop
-        original_wait = m.stop_event.wait
+        # Run one iteration then stop. The loop waits on wake_event, so hook
+        # that (unreachable+keep performs no apply_limits we could hook instead).
+        original_wait = m.wake_event.wait
         call_count = [0]
         def wait_and_stop(timeout):
             call_count[0] += 1
@@ -1478,7 +1526,7 @@ class TestMain(unittest.TestCase):
                 m.stop_event.set()
             return original_wait(0)
 
-        with patch.object(m.stop_event, "wait", side_effect=wait_and_stop), \
+        with patch.object(m.wake_event, "wait", side_effect=wait_and_stop), \
              patch("sys.argv", ["prog", "--dry-run"]):
             m.main()
 
@@ -1653,6 +1701,32 @@ class TestJellyfinEmbySessions(unittest.TestCase):
 
     def tearDown(self):
         m.JELLYFIN_URL, m.JELLYFIN_TOKEN, m.EMBY_URL, m.EMBY_TOKEN = self._saved
+
+    def test_lan_session_excluded_when_enabled(self):
+        data = json.dumps([
+            {"NowPlayingItem": {"Name": "lan", "Bitrate": 10_000_000},
+             "PlayState": {"IsPaused": False}, "RemoteEndPoint": "192.168.1.9"},
+            {"NowPlayingItem": {"Name": "wan", "Bitrate": 20_000_000},
+             "PlayState": {"IsPaused": False}, "RemoteEndPoint": "1.2.3.4:55123"},
+        ]).encode()
+        m.IGNORE_LAN_STREAMS = True
+        self.addCleanup(setattr, m, "IGNORE_LAN_STREAMS", False)
+        with patch("qbt_flow.urlopen", return_value=_make_response(data)):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 1)          # only the WAN stream
+        self.assertEqual(bps, 20_000_000)
+
+    def test_lan_session_counted_when_disabled(self):
+        data = json.dumps([
+            {"NowPlayingItem": {"Name": "lan", "Bitrate": 10_000_000},
+             "PlayState": {"IsPaused": False}, "RemoteEndPoint": "192.168.1.9"},
+            {"NowPlayingItem": {"Name": "wan", "Bitrate": 20_000_000},
+             "PlayState": {"IsPaused": False}, "RemoteEndPoint": "1.2.3.4:55123"},
+        ]).encode()
+        m.IGNORE_LAN_STREAMS = False
+        with patch("qbt_flow.urlopen", return_value=_make_response(data)):
+            count, bps = m.get_jellyfin_sessions()
+        self.assertEqual(count, 2)
 
     def test_jellyfin_active_session(self):
         data = json.dumps([
@@ -1904,6 +1978,65 @@ class TestStatusEndpoint(unittest.TestCase):
         m._StatusHandler.log_message(handler, "test %s", "arg")
         # Should not raise — just suppresses output
 
+    def test_webhook_post_sets_wake_event(self):
+        m.wake_event.clear()
+        orig_token = m.WEBHOOK_TOKEN
+        m.WEBHOOK_TOKEN = ""
+        self.addCleanup(setattr, m, "WEBHOOK_TOKEN", orig_token)
+        self.addCleanup(m.wake_event.clear)
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/webhook"
+        handler.headers = {"Content-Length": "0"}
+        m._StatusHandler.do_POST(handler)
+        handler.send_response.assert_called_with(204)
+        self.assertTrue(m.wake_event.is_set())
+
+    def test_webhook_notify_alias(self):
+        m.wake_event.clear()
+        orig_token = m.WEBHOOK_TOKEN
+        m.WEBHOOK_TOKEN = ""
+        self.addCleanup(setattr, m, "WEBHOOK_TOKEN", orig_token)
+        self.addCleanup(m.wake_event.clear)
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/notify"
+        handler.headers = {}
+        m._StatusHandler.do_POST(handler)
+        handler.send_response.assert_called_with(204)
+        self.assertTrue(m.wake_event.is_set())
+
+    def test_webhook_rejects_wrong_token(self):
+        m.wake_event.clear()
+        orig_token = m.WEBHOOK_TOKEN
+        m.WEBHOOK_TOKEN = "secret"
+        self.addCleanup(setattr, m, "WEBHOOK_TOKEN", orig_token)
+        self.addCleanup(m.wake_event.clear)
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/webhook"
+        handler.headers = {}
+        m._StatusHandler.do_POST(handler)
+        handler.send_response.assert_called_with(403)
+        self.assertFalse(m.wake_event.is_set())
+
+    def test_webhook_accepts_correct_token_via_query(self):
+        m.wake_event.clear()
+        orig_token = m.WEBHOOK_TOKEN
+        m.WEBHOOK_TOKEN = "secret"
+        self.addCleanup(setattr, m, "WEBHOOK_TOKEN", orig_token)
+        self.addCleanup(m.wake_event.clear)
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/webhook?token=secret"
+        handler.headers = {"Content-Length": "0"}
+        m._StatusHandler.do_POST(handler)
+        handler.send_response.assert_called_with(204)
+        self.assertTrue(m.wake_event.is_set())
+
+    def test_webhook_unknown_path_404(self):
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/nope"
+        handler.headers = {}
+        m._StatusHandler.do_POST(handler)
+        handler.send_response.assert_called_with(404)
+
 
 # ---------------------------------------------------------------------------
 # Ramp-up (integration via main loop)
@@ -1916,10 +2049,12 @@ class TestRampUp(unittest.TestCase):
         self._orig_dry   = m.DRY_RUN
         self._orig_ramp  = m.RAMP_UP_STEPS
         self._orig_poll  = m.POLL_INTERVAL
+        self._orig_poll_active = m.POLL_INTERVAL_ACTIVE
         m.last_dl_limit = None
         m.last_ul_limit = None
         m.last_racing_active = None
         m.POLL_INTERVAL = 0
+        m.POLL_INTERVAL_ACTIVE = 0  # loop waits on wake_event(interval); keep it instant
 
     def tearDown(self):
         m.PLEX_TOKEN    = self._orig_token
@@ -1927,10 +2062,12 @@ class TestRampUp(unittest.TestCase):
         m.DRY_RUN       = self._orig_dry
         m.RAMP_UP_STEPS = self._orig_ramp
         m.POLL_INTERVAL = self._orig_poll
+        m.POLL_INTERVAL_ACTIVE = self._orig_poll_active
         m.last_dl_limit = None
         m.last_ul_limit = None
         m.last_racing_active = None
         m.stop_event.clear()
+        m.wake_event.clear()
 
     @patch("qbt_flow._start_status_server")
     @patch("qbt_flow.apply_limits")
@@ -2120,14 +2257,18 @@ class TestMainBackoff(unittest.TestCase):
         self._orig_dry   = m.DRY_RUN
         self._orig_ramp  = m.RAMP_UP_STEPS
         self._orig_poll  = m.POLL_INTERVAL
+        self._orig_poll_active = m.POLL_INTERVAL_ACTIVE
         m.POLL_INTERVAL = 0
+        m.POLL_INTERVAL_ACTIVE = 0
 
     def tearDown(self):
         m.QBT_INSTANCES = self._orig_inst
         m.DRY_RUN       = self._orig_dry
         m.RAMP_UP_STEPS = self._orig_ramp
         m.POLL_INTERVAL = self._orig_poll
+        m.POLL_INTERVAL_ACTIVE = self._orig_poll_active
         m.stop_event.clear()
+        m.wake_event.clear()
 
     @patch("qbt_flow._start_status_server")
     @patch("qbt_flow.apply_limits")
@@ -2139,14 +2280,14 @@ class TestMainBackoff(unittest.TestCase):
         m.RAMP_UP_STEPS = 0
 
         call_count = [0]
-        original_wait = m.stop_event.wait
+        original_wait = m.wake_event.wait
         def wait_and_stop(timeout):
             call_count[0] += 1
             if call_count[0] >= 2:
                 m.stop_event.set()
             return original_wait(0)
 
-        with patch.object(m.stop_event, "wait", side_effect=wait_and_stop), \
+        with patch.object(m.wake_event, "wait", side_effect=wait_and_stop), \
              patch("sys.argv", ["prog", "--dry-run"]):
             m.main()
 
@@ -2348,7 +2489,9 @@ class TestMainStatusLabelUnreachable(unittest.TestCase):
         self._orig_dry   = m.DRY_RUN
         self._orig_ramp  = m.RAMP_UP_STEPS
         self._orig_poll  = m.POLL_INTERVAL
+        self._orig_poll_active = m.POLL_INTERVAL_ACTIVE
         m.POLL_INTERVAL  = 0
+        m.POLL_INTERVAL_ACTIVE = 0
         m.last_dl_limit  = None
         m.last_ul_limit  = None
         m.last_racing_active = None
@@ -2359,10 +2502,12 @@ class TestMainStatusLabelUnreachable(unittest.TestCase):
         m.DRY_RUN       = self._orig_dry
         m.RAMP_UP_STEPS = self._orig_ramp
         m.POLL_INTERVAL = self._orig_poll
+        m.POLL_INTERVAL_ACTIVE = self._orig_poll_active
         m.last_dl_limit = None
         m.last_ul_limit = None
         m.last_racing_active = None
         m.stop_event.clear()
+        m.wake_event.clear()
 
     @patch("qbt_flow._start_status_server")
     @patch("qbt_flow.apply_limits")
@@ -2658,7 +2803,9 @@ class TestMainLoopMultiCycle(unittest.TestCase):
         self._orig_dry   = m.DRY_RUN
         self._orig_ramp  = m.RAMP_UP_STEPS
         self._orig_poll  = m.POLL_INTERVAL
+        self._orig_poll_active = m.POLL_INTERVAL_ACTIVE
         m.POLL_INTERVAL  = 0
+        m.POLL_INTERVAL_ACTIVE = 0
         m.last_dl_limit  = None
         m.last_ul_limit  = None
         m.last_racing_active = None
@@ -2669,10 +2816,12 @@ class TestMainLoopMultiCycle(unittest.TestCase):
         m.DRY_RUN       = self._orig_dry
         m.RAMP_UP_STEPS = self._orig_ramp
         m.POLL_INTERVAL = self._orig_poll
+        m.POLL_INTERVAL_ACTIVE = self._orig_poll_active
         m.last_dl_limit = None
         m.last_ul_limit = None
         m.last_racing_active = None
         m.stop_event.clear()
+        m.wake_event.clear()
 
     @patch("qbt_flow._start_status_server")
     @patch("qbt_flow.apply_limits")

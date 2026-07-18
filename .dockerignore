@@ -1,0 +1,3 @@
+# Only qbt_flow.py is needed in the image.
+*
+!qbt_flow.py

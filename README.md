@@ -4,7 +4,7 @@ Automatic upload bandwidth manager for qBittorrent that prevents media-server bu
 
 qbt-flow watches your Plex, Jellyfin, or Emby server for active streams and dynamically adjusts qBittorrent's upload speed limit based on real-time bandwidth usage. Media streams consume your server's upload bandwidth (server → remote viewer), so qbt-flow throttles upload to guarantee smooth playback. When playback stops, limits ramp back up gradually and qBittorrent returns to full speed — no manual intervention needed. Download throttling is available but disabled by default since it doesn't compete with outbound streams.
 
-Optionally supports multiple qBittorrent instances and a racing window where one instance gets priority bandwidth during configurable hours.
+Optionally supports multiple qBittorrent instances, a racing window where one instance gets priority bandwidth during configurable hours, LAN-stream exclusion (don't throttle for local playback), instant webhook-driven reaction, and a Docker image.
 
 ## How it works
 
@@ -54,6 +54,22 @@ $EDITOR config.env   # fill in your media server URLs/tokens, QBT_INSTANCES, etc
 ./install.sh          # install systemd service (or run: python3 qbt_flow.py)
 ```
 
+### Docker
+
+A prebuilt image is published to GitHub Container Registry:
+
+```bash
+docker run -d --name qbt-flow --network host \
+  -e QBT_INSTANCES="192.168.1.10:8080:admin:adminadmin" \
+  -e PLEX_URL="http://192.168.1.10:32400" -e PLEX_TOKEN="your-token" \
+  -e TOTAL_UPLOAD="50Mbps" -e STATUS_PORT="9101" \
+  ghcr.io/smit-p/qbt-flow:latest
+```
+
+Or with Compose — copy [`docker-compose.example.yml`](docker-compose.example.yml) to `docker-compose.yml`, edit the values, and `docker compose up -d`.
+
+Every `config.env` setting is passed as an `-e` environment variable. The image is stdlib-only (no dependencies), multi-arch (amd64/arm64), logs to stdout, and ships a healthcheck against `/status`.
+
 ## Configuration
 
 Copy `config.env.example` to `config.env` and edit the values. All settings can also be passed as environment variables.
@@ -77,12 +93,15 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `MIN_QBT_UL` | `5MB/s` | Minimum upload limit |
 | `STREAM_OVERHEAD_FACTOR` | `1.25` | Multiplier on stream bitrates to account for buffering |
 | `POLL_INTERVAL` | `15` | Seconds between media server session polls |
+| `POLL_INTERVAL_ACTIVE` | (= `POLL_INTERVAL`) | Poll interval while streaming/ramping. Set lower (e.g. `5`) to react faster when active without polling hard while idle |
+| `IGNORE_LAN_STREAMS` | `false` | Skip streams playing to a LAN client (private/loopback/link-local IP; also Plex's `local` flag) — they use no WAN upload, so no throttling needed |
 | `REQUEST_TIMEOUT` | `10` | HTTP request timeout in seconds |
 | `UNREACHABLE_ACTION` | `keep` | What to do when all media servers are down: `keep` (retain last limits) or `unlimited` |
 | `RAMP_UP_STEPS` | `3` | Cycles to ramp from throttled → unlimited when streams stop (0 = instant). Each step doubles the limit |
 | `BACKOFF_MAX_INTERVAL` | `300` | Max per-server exponential backoff (seconds) when a media server is unreachable |
-| `STATUS_PORT` | `0` (disabled) | Port for the status/metrics HTTP endpoint. Set to e.g. `9101` to enable |
-| `LOG_FILE` | `throttle.log` (in script dir) | Log file path |
+| `STATUS_PORT` | `0` (disabled) | Port for the status / metrics / webhook HTTP endpoint. Set to e.g. `9101` to enable |
+| `WEBHOOK_TOKEN` | *(none)* | Optional shared secret required on `POST /webhook` (via `?token=` or `X-Webhook-Token` header) |
+| `LOG_FILE` | `throttle.log` (in script dir) | Log file path. Set empty to log to stdout only (Docker) |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `LOG_MAX_SIZE` | `5MB` | Max size per log file before rotation |
 | `LOG_BACKUP_COUNT` | `3` | Number of rotated log files to keep |
@@ -183,6 +202,26 @@ STATUS_PORT=9101
 curl -s http://localhost:9101/status | python3 -m json.tool
 curl -s http://localhost:9101/metrics
 ```
+
+### Webhooks (instant reaction)
+
+By default qbt-flow reacts within one poll interval. For **instant** throttling the moment playback starts, point your media server's webhook at the same port:
+
+```
+POST http://<host>:9101/webhook
+```
+
+Any POST triggers an immediate re-poll (the body is ignored, so Plex/Tautulli/Jellyfin/Emby webhook formats all work as-is). Set `WEBHOOK_TOKEN` to require a secret via `?token=…` or an `X-Webhook-Token` header:
+
+```bash
+curl -X POST "http://localhost:9101/webhook?token=your-secret"
+```
+
+- **Plex**: Settings → Webhooks → add `http://<host>:9101/webhook` (Plex Pass required).
+- **Tautulli**: add a Webhook notification agent on *Playback Start* / *Stop* pointing at the same URL.
+- **Jellyfin/Emby**: use the Webhook plugin.
+
+Complementary to webhooks, `POLL_INTERVAL_ACTIVE` polls faster while a stream is active so mid-stream changes (a second stream starting, playback stopping) are also caught quickly.
 
 ## Run as a systemd service
 

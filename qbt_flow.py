@@ -17,6 +17,7 @@ from environment variables. Copy config.env.example to config.env to get started
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -31,7 +32,7 @@ from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.request import urlopen, Request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.error import URLError, HTTPError
 
 # ---------------------------------------------------------------------------
@@ -268,7 +269,21 @@ NORMAL_UL_BYTES = 0  # unlimited
 STREAM_OVERHEAD_FACTOR = _env_float("STREAM_OVERHEAD_FACTOR", 1.25)
 
 POLL_INTERVAL   = _env_int("POLL_INTERVAL",   15)   # seconds between checks
+# Poll interval while streams are active (or ramping down).  Defaults to
+# POLL_INTERVAL so behaviour is unchanged; set it lower (e.g. 5) to react
+# faster to stream count changes without hammering servers when idle.
+POLL_INTERVAL_ACTIVE = _env_int("POLL_INTERVAL_ACTIVE", POLL_INTERVAL)
 REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 10)
+
+# Ignore streams playing to a LAN/local client — those consume no WAN upload,
+# so there's no need to throttle torrents for them.  Detected via the client IP
+# (private / loopback / link-local ranges) and, for Plex, the Player 'local'
+# flag.  Default off to preserve existing behaviour.
+IGNORE_LAN_STREAMS = _env("IGNORE_LAN_STREAMS", "false").lower() in ("true", "1", "yes")
+
+# Optional shared secret for the /webhook endpoint.  When set, requests must
+# supply it via ?token=... or an X-Webhook-Token header.  Empty = no auth.
+WEBHOOK_TOKEN = _env("WEBHOOK_TOKEN", "")
 
 # Behavior when media server is unreachable: "unlimited" or "keep" (last limits)
 UNREACHABLE_ACTION = _env("UNREACHABLE_ACTION", "keep")
@@ -306,15 +321,18 @@ LOG_BACKUP_COUNT = _env_int("LOG_BACKUP_COUNT", 3)
 # Logging
 # ---------------------------------------------------------------------------
 
+# Always log to stdout; add a rotating file handler unless LOG_FILE is empty
+# (set LOG_FILE= to log to stdout only, e.g. in Docker where the platform
+# captures container logs).
+_log_handlers = [logging.StreamHandler(sys.stdout)]
+if LOG_FILE:
+    _log_handlers.insert(0, logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=LOG_BACKUP_COUNT
+    ))
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.handlers.RotatingFileHandler(
-            LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=LOG_BACKUP_COUNT
-        ),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=_log_handlers,
 )
 log = logging.getLogger("qbt_flow")
 
@@ -343,13 +361,19 @@ _status = {
     "racing_active": False,
     "label": "STARTING",
     "media_servers": [],
+    "last_webhook": 0,
 }
 
 stop_event = threading.Event()
+# Set to wake the main loop early (webhook received, or shutdown).  The loop
+# waits on this instead of sleeping a fixed interval, so a webhook triggers an
+# immediate re-poll.
+wake_event = threading.Event()
 
 def handle_signal(signum, frame):
     log.info("Received signal %d, shutting down", signum)
     stop_event.set()
+    wake_event.set()  # break the poll wait immediately
 
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
@@ -361,6 +385,38 @@ DRY_RUN = False
 def _fmt_speed(bytes_per_sec):
     """Format a speed value for logging: 0 → 'unlimited', else '12.3 MB/s'."""
     return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s" if bytes_per_sec else "unlimited"
+
+
+# Networks considered "local" — RFC1918 + loopback + link-local + IPv6 ULA.
+# Deliberately narrower than ipaddress.is_private, which also flags CGNAT
+# (100.64/10) and documentation ranges we'd want treated as remote (WAN).
+_LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",  # RFC1918
+    "127.0.0.0/8", "169.254.0.0/16",                   # loopback, link-local
+    "fc00::/7", "fe80::/10", "::1/128",                # IPv6 ULA, link-local, loopback
+))
+
+
+def _client_is_lan(addr):
+    """
+    True if *addr* is on the local network (RFC1918 / loopback / link-local /
+    IPv6 ULA) — a client whose stream consumes no WAN upload.  Accepts a bare
+    IP or a "host:port" / "[v6]:port" form (as returned by Jellyfin/Emby's
+    RemoteEndPoint or Plex's Player address).  Unparseable input → False (i.e.
+    treated as remote, the safe default: we'd rather throttle than under-throttle).
+    """
+    if not addr:
+        return False
+    addr = str(addr).strip()
+    if addr.startswith("["):          # [v6]:port or [v6]
+        addr = addr[1:].split("]", 1)[0]
+    elif addr.count(":") == 1:        # ipv4:port
+        addr = addr.split(":", 1)[0]
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in net for net in _LAN_NETWORKS)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +477,11 @@ def get_plex_sessions(url=None, token=None):
                 title = session.attrib.get("title", "unknown")
                 log.debug("Plex: skipping %s session '%s'", state, title)
                 continue
+            if IGNORE_LAN_STREAMS and player is not None and (
+                    player.attrib.get("local") == "1"
+                    or _client_is_lan(player.attrib.get("address", ""))):
+                log.debug("Plex: skipping LAN session '%s'", session.attrib.get("title", "unknown"))
+                continue
             count += 1
             # Plex reports bitrate in kbps on the Session element.
             # Fall back to the Media element if not present at top level.
@@ -469,6 +530,10 @@ def _get_jellyfin_emby_sessions(url=None, token=None, path_prefix="", server_typ
             if play_state.get("IsPaused", False):
                 item_name = now_playing.get("Name", "unknown")
                 log.debug("%s: skipping paused session '%s'", server_type, item_name)
+                continue
+            if IGNORE_LAN_STREAMS and _client_is_lan(session.get("RemoteEndPoint", "")):
+                log.debug("%s: skipping LAN session '%s'",
+                          server_type, now_playing.get("Name", "unknown"))
                 continue
             count += 1
             # Bitrate may be on NowPlayingItem, TranscodingInfo, or MediaSources
@@ -948,6 +1013,33 @@ class _StatusHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/webhook", "/notify"):
+            if WEBHOOK_TOKEN:
+                supplied = (parse_qs(parsed.query).get("token", [""])[0]
+                            or self.headers.get("X-Webhook-Token", ""))
+                if supplied != WEBHOOK_TOKEN:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+            # Drain the request body so the sender doesn't see a broken pipe.
+            # The content is irrelevant — any webhook means "re-poll now".
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length:
+                    self.rfile.read(length)
+            except (ValueError, OSError):
+                pass
+            _status["last_webhook"] = int(time.time())
+            wake_event.set()
+            log.debug("Webhook received, triggering immediate re-poll")
+            self.send_response(204)
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def log_message(self, format, *args):
         pass  # suppress default access log
 
@@ -962,7 +1054,8 @@ def _start_status_server():
         return None
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    log.info("Status endpoint listening on port %d", STATUS_PORT)
+    log.info("Status endpoint listening on port %d (GET /status, /metrics; POST /webhook)",
+             STATUS_PORT)
     return server
 
 # ---------------------------------------------------------------------------
@@ -1009,7 +1102,9 @@ def main():
     log.info("  qBt instances : %s", instance_list)
     log.info("  Line speed    : DL %.0f Mbps / UL %.0f Mbps",
              TOTAL_BANDWIDTH_BPS / 1_000_000, TOTAL_UPLOAD_BPS / 1_000_000)
-    log.info("  Poll interval : %ds", POLL_INTERVAL)
+    log.info("  Poll interval : %ds (idle) / %ds (active)%s",
+             POLL_INTERVAL, POLL_INTERVAL_ACTIVE,
+             "  ignore-LAN" if IGNORE_LAN_STREAMS else "")
     log.info("  DL fraction=%.2f  UL fraction=%.2f  overhead=%.2fx  "
              "min DL=%s  min UL=%s",
              QBT_HEADROOM_FRACTION, QBT_UPLOAD_FRACTION,
@@ -1104,7 +1199,15 @@ def main():
                 else:
                     _status["label"] = "NORMAL"
 
-            stop_event.wait(POLL_INTERVAL)
+            if stop_event.is_set():
+                break
+            # Poll faster while streams are active or ramping down; a webhook
+            # (wake_event) breaks the wait early for an immediate re-poll.
+            active = session_count > 0 or ramp_remaining > 0
+            interval = POLL_INTERVAL_ACTIVE if active else POLL_INTERVAL
+            if wake_event.wait(interval) and not stop_event.is_set():
+                log.debug("Re-polling early (woken by webhook)")
+            wake_event.clear()
     finally:
         # Remove throttles on exit so qBittorrent isn't left limited
         if not DRY_RUN:

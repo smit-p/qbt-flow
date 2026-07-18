@@ -1,0 +1,43 @@
+# Example docker-compose for qbt-flow.
+# Copy to docker-compose.yml and edit the environment values for your setup.
+#
+#   docker compose up -d
+#
+# All settings from config.env.example are supported as environment variables;
+# only the essentials are shown here.
+
+services:
+  qbt-flow:
+    image: ghcr.io/smit-p/qbt-flow:latest
+    # Or build locally instead of pulling:
+    # build: .
+    container_name: qbt-flow
+    restart: unless-stopped
+    # host networking makes it trivial to reach qBittorrent / media servers on
+    # your LAN and to receive webhooks; drop it and map ports if you prefer.
+    network_mode: host
+    environment:
+      # --- Media server(s): set at least one URL + token ---
+      PLEX_URL: "http://192.168.1.10:32400"
+      PLEX_TOKEN: "your-plex-token"
+      # JELLYFIN_URL: "http://192.168.1.10:8096"
+      # JELLYFIN_TOKEN: "your-jellyfin-api-key"
+
+      # --- qBittorrent instance(s): host:port:user:pass[:scheme], comma-separated ---
+      QBT_INSTANCES: "192.168.1.10:8080:admin:adminadmin"
+
+      # --- Bandwidth ---
+      TOTAL_BANDWIDTH: "1Gbps"
+      TOTAL_UPLOAD: "50Mbps"
+      QBT_UPLOAD_FRACTION: "0.9"
+
+      # --- Optional enhancements ---
+      IGNORE_LAN_STREAMS: "true"     # don't throttle for streams to LAN clients
+      POLL_INTERVAL: "15"
+      POLL_INTERVAL_ACTIVE: "5"      # poll faster while streaming
+      STATUS_PORT: "9101"            # GET /status,/metrics ; POST /webhook
+      # WEBHOOK_TOKEN: "choose-a-secret"
+
+    # If NOT using host networking, expose the status/webhook port instead:
+    # ports:
+    #   - "9101:9101"
