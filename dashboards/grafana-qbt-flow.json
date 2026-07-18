@@ -1,0 +1,113 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping qbt-flow /metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["qbt-flow"],
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "qbt-flow",
+  "uid": "qbt-flow",
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "State",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "qbt_flow_state_info", "legendFormat": "{{label}}", "instant": true }
+      ],
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "/^label$/" }, "textMode": "name" }
+    },
+    {
+      "type": "stat",
+      "title": "Active streams",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "qbt_flow_streams", "legendFormat": "streams" } ],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Racing window",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "qbt_flow_racing_active", "legendFormat": "racing" } ],
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": { "0": { "text": "off" }, "1": { "text": "ON" } } } ], "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "purple", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Version",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "qbt_flow_build_info", "legendFormat": "{{version}}", "instant": true } ],
+      "options": { "reduceOptions": { "fields": "/^version$/" }, "textMode": "name" }
+    },
+    {
+      "type": "timeseries",
+      "title": "qBittorrent / Transmission speed limits",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } } },
+      "targets": [
+        { "expr": "qbt_flow_dl_limit_bytes", "legendFormat": "download limit" },
+        { "expr": "qbt_flow_ul_limit_bytes", "legendFormat": "upload limit" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Active stream bandwidth",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "bps", "custom": { "drawStyle": "line", "fillOpacity": 20, "showPoints": "never" } } },
+      "targets": [
+        { "expr": "qbt_flow_stream_bandwidth_bps", "legendFormat": "reserved for streams" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Streams over time",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 40, "showPoints": "never" } } },
+      "targets": [ { "expr": "qbt_flow_streams", "legendFormat": "streams" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [ { "expr": "qbt_flow_uptime_seconds" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Torrent clients",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [ { "expr": "qbt_flow_torrent_clients" } ]
+    }
+  ]
+}

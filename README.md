@@ -4,7 +4,7 @@ Automatic upload bandwidth manager for qBittorrent that prevents media-server bu
 
 qbt-flow watches your Plex, Jellyfin, or Emby server for active streams and dynamically adjusts qBittorrent's upload speed limit based on real-time bandwidth usage. Media streams consume your server's upload bandwidth (server → remote viewer), so qbt-flow throttles upload to guarantee smooth playback. When playback stops, limits ramp back up gradually and qBittorrent returns to full speed — no manual intervention needed. Download throttling is available but disabled by default since it doesn't compete with outbound streams.
 
-Optionally supports multiple qBittorrent instances, a racing window where one instance gets priority bandwidth during configurable hours, LAN-stream exclusion (don't throttle for local playback), instant webhook-driven reaction, and a Docker image.
+Works with **qBittorrent and Transmission** (mixed freely), and reads streams from **Plex, Jellyfin, Emby, or Tautulli**. Optionally supports multiple client instances, a racing window where one instance gets priority bandwidth during configurable hours, LAN-stream exclusion (don't throttle for local playback), instant webhook-driven reaction, Prometheus metrics + a Grafana dashboard, and a Docker image.
 
 ## How it works
 
@@ -21,8 +21,8 @@ Optionally supports multiple qBittorrent instances, a racing window where one in
 ## Requirements
 
 - Python 3.8+ (no third-party packages — stdlib only)
-- qBittorrent 4.1+ with Web UI enabled
-- Plex, Jellyfin, or Emby media server (accessible via HTTP)
+- qBittorrent 4.1+ with Web UI enabled (including 5.2+), and/or Transmission with RPC enabled
+- Plex, Jellyfin, Emby, or Tautulli (accessible via HTTP)
 
 ## Install
 
@@ -82,7 +82,10 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `JELLYFIN_TOKEN` | *(none)* | Jellyfin API key (Dashboard → API Keys → +) |
 | `EMBY_URL` | *(none)* | Emby URL. Set with `EMBY_TOKEN` to enable Emby polling |
 | `EMBY_TOKEN` | *(none)* | Emby API key (Dashboard → API Keys → +) |
-| `QBT_INSTANCES` | *(none — required)* | Comma-separated list of qBittorrent instances: `host:port:user:pass[:scheme]` |
+| `TAUTULLI_URL` | *(none)* | Tautulli URL. Set with `TAUTULLI_TOKEN` to poll Tautulli (aggregates Plex; reports real per-session bandwidth and LAN/WAN) |
+| `TAUTULLI_TOKEN` | *(none)* | Tautulli API key (Settings → Web Interface → API key) |
+| `QBT_INSTANCES` | *(none)* | Comma-separated qBittorrent instances: `host:port:user:pass[:scheme]`. Required unless `TRANSMISSION_INSTANCES` is set |
+| `TRANSMISSION_INSTANCES` | *(none)* | Comma-separated Transmission instances, same format. Can be mixed with qBittorrent |
 | `TOTAL_BANDWIDTH` | `1Gbps` | Your download line speed. Accepts suffixes: `Mbps`, `Gbps` (bits/sec) or `MB/s`, `GB/s` (bytes/sec). Plain numbers = bits/sec |
 | `TOTAL_UPLOAD` | *(same as download)* | Your upload line speed — set for asymmetric connections |
 | `QBT_HEADROOM_FRACTION` | `1.0` | Fraction of remaining bandwidth to give qbt (download). Defaults to 1.0 (no throttling) since media streams use upload, not download |
@@ -175,7 +178,18 @@ JELLYFIN_URL=http://localhost:8096
 JELLYFIN_TOKEN=your-jellyfin-api-key
 ```
 
-Each server has its own exponential backoff tracker — if one goes down, the others continue working. For Emby, the URL is typically `http://host:8920`; qbt-flow adds the `/emby/` prefix automatically.
+Each server has its own exponential backoff tracker — if one goes down, the others continue working. For Emby, the URL is typically `http://host:8920`; qbt-flow adds the `/emby/` prefix automatically. **Tautulli** is also supported as a source (`TAUTULLI_URL` + `TAUTULLI_TOKEN`) — it aggregates Plex activity and reports real per-session bandwidth plus LAN/WAN location.
+
+### Torrent clients: qBittorrent + Transmission
+
+Set `QBT_INSTANCES`, `TRANSMISSION_INSTANCES`, or both — every configured client is throttled together, and multi-instance bandwidth splitting, dynamic split, and the racing window all work across a mixed fleet.
+
+```env
+QBT_INSTANCES=localhost:8080:admin:pass
+TRANSMISSION_INSTANCES=localhost:9091:user:pass   # host:9091:: if RPC auth is off
+```
+
+Transmission uses its RPC API (turtle mode maps to `QBT_RESPECT_ALT_LIMITS`); limits are converted to Transmission's KB/s automatically.
 
 ### Gradual ramp-up
 
@@ -195,13 +209,17 @@ Set `STATUS_PORT` to expose a lightweight HTTP status page:
 STATUS_PORT=9101
 ```
 
-- `GET /` or `GET /status` — JSON snapshot (streams, limits, uptime, configured servers).
+- `GET /` or `GET /status` — JSON snapshot (version, streams, limits, uptime, configured servers).
 - `GET /metrics` — Prometheus-compatible text format.
 
 ```bash
 curl -s http://localhost:9101/status | python3 -m json.tool
 curl -s http://localhost:9101/metrics
 ```
+
+Exposed metrics include `qbt_flow_up`, `qbt_flow_build_info{version}`, `qbt_flow_streams`, `qbt_flow_stream_bandwidth_bps`, `qbt_flow_dl_limit_bytes`, `qbt_flow_ul_limit_bytes`, `qbt_flow_racing_active`, `qbt_flow_torrent_clients`, `qbt_flow_state_info{label}`, `qbt_flow_last_webhook_timestamp_seconds`, and `qbt_flow_uptime_seconds`.
+
+A ready-made **Grafana dashboard** lives at [`dashboards/grafana-qbt-flow.json`](dashboards/grafana-qbt-flow.json) — import it and pick your Prometheus datasource.
 
 ### Webhooks (instant reaction)
 

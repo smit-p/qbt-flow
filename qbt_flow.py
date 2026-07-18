@@ -17,6 +17,7 @@ from environment variables. Copy config.env.example to config.env to get started
 """
 
 import argparse
+import base64
 import ipaddress
 import json
 import os
@@ -34,6 +35,8 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode, urlparse, parse_qs
 from urllib.error import URLError, HTTPError
+
+__version__ = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Config loader
@@ -175,15 +178,18 @@ JELLYFIN_URL   = _env("JELLYFIN_URL", "")
 JELLYFIN_TOKEN = _env("JELLYFIN_TOKEN", "")
 EMBY_URL       = _env("EMBY_URL", "")
 EMBY_TOKEN     = _env("EMBY_TOKEN", "")
+# Tautulli — aggregates Plex activity and reports per-session bandwidth and
+# LAN/WAN location directly.  TAUTULLI_TOKEN is the Tautulli API key.
+TAUTULLI_URL   = _env("TAUTULLI_URL", "")
+TAUTULLI_TOKEN = _env("TAUTULLI_TOKEN", "")
 
 # Default Plex URL when nothing else is configured
-if not PLEX_URL and not JELLYFIN_URL and not EMBY_URL:
+if not (PLEX_URL or JELLYFIN_URL or EMBY_URL or TAUTULLI_URL):
     PLEX_URL = "http://localhost:32400"
 
-# qBittorrent instances as "host:port:user:pass[:scheme]" comma-separated pairs
-# e.g. QBT_INSTANCES=localhost:8080:admin:password,localhost:8443:admin:password:https
-def _parse_qbt_instances():
-    raw = _env("QBT_INSTANCES", "")
+# Torrent-client instances as "host:port:user:pass[:scheme]" comma-separated
+# pairs, e.g. host:8080:admin:password,host:8443:admin:password:https
+def _parse_instances(raw, var_name):
     instances = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -194,14 +200,16 @@ def _parse_qbt_instances():
             host, port, user, password = parts[0], parts[1], parts[2], parts[3]
             scheme = parts[4] if len(parts) == 5 else "http"
             if scheme not in ("http", "https"):
-                print(f"WARNING: invalid scheme {scheme!r} in QBT_INSTANCES entry: {entry!r}", file=sys.stderr)
+                print(f"WARNING: invalid scheme {scheme!r} in {var_name} entry: {entry!r}", file=sys.stderr)
                 scheme = "http"
             instances.append((host, int(port), user, password, scheme))
         else:
-            print(f"WARNING: invalid QBT_INSTANCES entry: {entry!r} (expected host:port:user:pass[:scheme])", file=sys.stderr)
+            print(f"WARNING: invalid {var_name} entry: {entry!r} (expected host:port:user:pass[:scheme])", file=sys.stderr)
     return instances
 
-QBT_INSTANCES = _parse_qbt_instances()
+QBT_INSTANCES = _parse_instances(_env("QBT_INSTANCES", ""), "QBT_INSTANCES")
+# Transmission instances (same host:port:user:pass[:scheme] format).
+TRANSMISSION_INSTANCES = _parse_instances(_env("TRANSMISSION_INSTANCES", ""), "TRANSMISSION_INSTANCES")
 
 # Your line speed (download).  Accepts plain numbers (bits/sec) or suffixes:
 #   1Gbps, 500Mbps, 100Mbps (bits) or 125MB/s (bytes — normalised to bits).
@@ -355,12 +363,15 @@ last_apply_failed = False  # True if any instance failed login/set last cycle (r
 
 _start_time = 0.0
 _status = {
+    "version": __version__,
     "streams": 0,
+    "stream_bandwidth_bps": 0,
     "dl_limit": 0,
     "ul_limit": 0,
     "racing_active": False,
     "label": "STARTING",
     "media_servers": [],
+    "torrent_clients": 0,
     "last_webhook": 0,
 }
 
@@ -566,6 +577,48 @@ def get_emby_sessions(url=None, token=None):
 
 
 # ---------------------------------------------------------------------------
+# Tautulli helpers
+# ---------------------------------------------------------------------------
+
+def get_tautulli_sessions(url=None, token=None):
+    """
+    Tautulli session fetcher via its get_activity API.  Tautulli reports the
+    real per-session bandwidth (kbps) and the stream location (lan/wan), which
+    it derives from Plex — handy for IGNORE_LAN_STREAMS.
+    Returns (session_count, total_bitrate_bps).  (-1, 0) on error.
+    """
+    url = url or TAUTULLI_URL
+    token = token or TAUTULLI_TOKEN
+    req_url = f"{url}/api/v2?apikey={token}&cmd=get_activity"
+    req = Request(req_url, headers={"Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            payload = json.loads(resp.read())
+        data = payload.get("response", {}).get("data") or {}
+        sessions = data.get("sessions", [])
+        count = 0
+        total_kbps = 0
+        for session in sessions:
+            state = session.get("state", "playing")
+            if state in ("paused", "stopped", "buffering"):
+                continue
+            if IGNORE_LAN_STREAMS and str(session.get("location", "")).lower() == "lan":
+                log.debug("Tautulli: skipping LAN session '%s'", session.get("full_title", "unknown"))
+                continue
+            count += 1
+            try:
+                total_kbps += int(float(session.get("bandwidth") or 0))
+            except (TypeError, ValueError):
+                pass
+        total_bps = total_kbps * 1000
+        log.debug("Tautulli: %d active stream(s), total %d kbps", count, total_kbps)
+        return count, total_bps
+    except (URLError, HTTPError, json.JSONDecodeError, ValueError, KeyError) as e:
+        log.warning("Tautulli session check failed (%s): %s", url, e)
+        return -1, 0
+
+
+# ---------------------------------------------------------------------------
 # Multi-server aggregation
 # ---------------------------------------------------------------------------
 
@@ -576,6 +629,8 @@ if JELLYFIN_URL and JELLYFIN_TOKEN:
     _configured_servers.append(("jellyfin", JELLYFIN_URL, JELLYFIN_TOKEN, get_jellyfin_sessions))
 if EMBY_URL and EMBY_TOKEN:
     _configured_servers.append(("emby", EMBY_URL, EMBY_TOKEN, get_emby_sessions))
+if TAUTULLI_URL and TAUTULLI_TOKEN:
+    _configured_servers.append(("tautulli", TAUTULLI_URL, TAUTULLI_TOKEN, get_tautulli_sessions))
 
 _status["media_servers"] = [name for name, _, _, _ in _configured_servers]
 
@@ -764,7 +819,115 @@ class QbtClient:
         return dl_count, ul_count
 
 
-clients = [QbtClient(h, p, u, pw, s) for h, p, u, pw, s in QBT_INSTANCES]
+# ---------------------------------------------------------------------------
+# Transmission client (RPC) — same interface as QbtClient so apply_limits and
+# the dynamic-split logic work with either client type interchangeably.
+# ---------------------------------------------------------------------------
+
+class TransmissionClient:
+    def __init__(self, host, port, username, password, scheme="http"):
+        self.base = f"{scheme}://{host}:{port}"
+        self.rpc_url = f"{self.base}/transmission/rpc"
+        self.username = username
+        self.password = password
+        self.session_id = None
+        # `cookie` is set to None by apply_limits on failure; keep the attribute
+        # for interface parity with QbtClient (Transmission uses session_id).
+        self.cookie = "transmission"
+
+    def _auth_header(self):
+        if not self.username:
+            return {}
+        token = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
+        return {"Authorization": f"Basic {token}"}
+
+    def _rpc(self, method, arguments=None, _retry=True):
+        """Perform a Transmission RPC call, handling the 409 session-id handshake."""
+        body = json.dumps({"method": method, "arguments": arguments or {}}).encode()
+        headers = {"Content-Type": "application/json"}
+        headers.update(self._auth_header())
+        if self.session_id:
+            headers["X-Transmission-Session-Id"] = self.session_id
+        req = Request(self.rpc_url, data=body, headers=headers)
+        try:
+            with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                return json.loads(resp.read().decode())
+        except HTTPError as e:
+            if e.code == 409 and _retry:
+                # Transmission hands back a fresh session id in the 409 headers.
+                self.session_id = e.headers.get("X-Transmission-Session-Id")
+                if self.session_id:
+                    return self._rpc(method, arguments, _retry=False)
+            log.warning("transmission %s RPC %s failed: %s", self.base, method, e)
+            return None
+        except (URLError, ValueError) as e:
+            log.warning("transmission %s RPC %s failed: %s", self.base, method, e)
+            return None
+
+    def login(self):
+        # A no-arg session-get both validates credentials and primes session_id.
+        resp = self._rpc("session-get")
+        ok = bool(resp) and resp.get("result") == "success"
+        if ok:
+            log.debug("transmission login successful at %s", self.base)
+        else:
+            log.warning("transmission login failed at %s", self.base)
+        return ok
+
+    def ensure_logged_in(self):
+        if not self.session_id:
+            return self.login()
+        return True
+
+    def set_speed_limits(self, dl_bytes, ul_bytes):
+        # Transmission speed limits are in KB/s; 0 bytes means "unlimited"
+        # (disable the limit rather than set it to 0).
+        args = {}
+        if dl_bytes and dl_bytes > 0:
+            args["speed-limit-down"] = max(1, int(dl_bytes // 1024))
+            args["speed-limit-down-enabled"] = True
+        else:
+            args["speed-limit-down-enabled"] = False
+        if ul_bytes and ul_bytes > 0:
+            args["speed-limit-up"] = max(1, int(ul_bytes // 1024))
+            args["speed-limit-up-enabled"] = True
+        else:
+            args["speed-limit-up-enabled"] = False
+        resp = self._rpc("session-set", args)
+        return bool(resp) and resp.get("result") == "success"
+
+    def is_alt_limits_active(self):
+        """True if Transmission's alternative ('turtle') speed limits are on."""
+        resp = self._rpc("session-get")
+        if not resp or resp.get("result") != "success":
+            return False
+        return bool(resp.get("arguments", {}).get("alt-speed-enabled", False))
+
+    def get_torrent_activity(self, dl_threshold=0, ul_threshold=0):
+        """
+        Returns (dl_count, ul_count) of torrents actively transferring above the
+        thresholds.  Transmission status codes: 4 = downloading, 6 = seeding.
+        Returns None on query failure (callers treat that as active, fail-open).
+        """
+        resp = self._rpc("torrent-get", {"fields": ["status", "rateDownload", "rateUpload"]})
+        if not resp or resp.get("result") != "success":
+            return None
+        torrents = resp.get("arguments", {}).get("torrents", [])
+        dl_count = sum(
+            1 for t in torrents
+            if t.get("status") == 4 and t.get("rateDownload", 0) > dl_threshold
+        )
+        ul_count = sum(
+            1 for t in torrents
+            if t.get("status") == 6 and t.get("rateUpload", 0) > ul_threshold
+        )
+        return dl_count, ul_count
+
+
+clients = (
+    [QbtClient(h, p, u, pw, s) for h, p, u, pw, s in QBT_INSTANCES]
+    + [TransmissionClient(h, p, u, pw, s) for h, p, u, pw, s in TRANSMISSION_INSTANCES]
+)
 
 
 def _is_racing_window():
@@ -997,11 +1160,40 @@ class _StatusHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/metrics":
             _status["uptime_seconds"] = int(time.monotonic() - _start_time)
+            _label = _status["label"]
             lines = [
+                '# HELP qbt_flow_up Whether qbt-flow is running.',
+                '# TYPE qbt_flow_up gauge',
+                'qbt_flow_up 1',
+                '# HELP qbt_flow_build_info Build/version info.',
+                '# TYPE qbt_flow_build_info gauge',
+                f'qbt_flow_build_info{{version="{__version__}"}} 1',
+                '# HELP qbt_flow_streams Active media streams being reserved for.',
+                '# TYPE qbt_flow_streams gauge',
                 f'qbt_flow_streams {_status["streams"]}',
+                '# HELP qbt_flow_stream_bandwidth_bps Reported bitrate of active streams (bits/sec).',
+                '# TYPE qbt_flow_stream_bandwidth_bps gauge',
+                f'qbt_flow_stream_bandwidth_bps {_status["stream_bandwidth_bps"]}',
+                '# HELP qbt_flow_dl_limit_bytes Current per-cycle download limit (0 = unlimited).',
+                '# TYPE qbt_flow_dl_limit_bytes gauge',
                 f'qbt_flow_dl_limit_bytes {_status["dl_limit"]}',
+                '# HELP qbt_flow_ul_limit_bytes Current per-cycle upload limit (0 = unlimited).',
+                '# TYPE qbt_flow_ul_limit_bytes gauge',
                 f'qbt_flow_ul_limit_bytes {_status["ul_limit"]}',
+                '# HELP qbt_flow_racing_active Whether the racing window is active.',
+                '# TYPE qbt_flow_racing_active gauge',
                 f'qbt_flow_racing_active {1 if _status["racing_active"] else 0}',
+                '# HELP qbt_flow_torrent_clients Number of configured torrent clients.',
+                '# TYPE qbt_flow_torrent_clients gauge',
+                f'qbt_flow_torrent_clients {_status["torrent_clients"]}',
+                '# HELP qbt_flow_state_info Current state label.',
+                '# TYPE qbt_flow_state_info gauge',
+                f'qbt_flow_state_info{{label="{_label}"}} 1',
+                '# HELP qbt_flow_last_webhook_timestamp_seconds Unix time of the last webhook received.',
+                '# TYPE qbt_flow_last_webhook_timestamp_seconds gauge',
+                f'qbt_flow_last_webhook_timestamp_seconds {_status["last_webhook"]}',
+                '# HELP qbt_flow_uptime_seconds Seconds since start.',
+                '# TYPE qbt_flow_uptime_seconds counter',
                 f'qbt_flow_uptime_seconds {_status["uptime_seconds"]}',
             ]
             body = "\n".join(lines).encode() + b"\n"
@@ -1066,9 +1258,11 @@ def _validate_config():
     errors = []
     if not _configured_servers:
         errors.append("No media server configured — set PLEX_URL+PLEX_TOKEN, "
-                      "JELLYFIN_URL+JELLYFIN_TOKEN, or EMBY_URL+EMBY_TOKEN")
-    if not QBT_INSTANCES:
-        errors.append("No valid QBT_INSTANCES configured")
+                      "JELLYFIN_URL+JELLYFIN_TOKEN, EMBY_URL+EMBY_TOKEN, or "
+                      "TAUTULLI_URL+TAUTULLI_TOKEN")
+    if not QBT_INSTANCES and not TRANSMISSION_INSTANCES:
+        errors.append("No torrent client configured — set QBT_INSTANCES "
+                      "and/or TRANSMISSION_INSTANCES")
     if UNREACHABLE_ACTION not in ("keep", "unlimited"):
         errors.append(f"Invalid UNREACHABLE_ACTION={UNREACHABLE_ACTION!r} "
                       f"(must be 'keep' or 'unlimited')")
@@ -1094,12 +1288,16 @@ def main():
     _validate_config()
 
     _start_time = time.monotonic()
+    _status["torrent_clients"] = len(clients)
 
     server_names = "+".join(name for name, _, _, _ in _configured_servers)
-    instance_list = ", ".join(f"{s}://{h}:{p}" for h, p, _, _, s in QBT_INSTANCES)
-    log.info("qbt-flow starting%s", " (DRY-RUN)" if DRY_RUN else "")
+    instance_list = ", ".join(
+        f"{s}://{h}:{p}" for h, p, _, _, s in (QBT_INSTANCES + TRANSMISSION_INSTANCES))
+    log.info("qbt-flow %s starting%s", __version__, " (DRY-RUN)" if DRY_RUN else "")
     log.info("  Media servers : %s", server_names)
-    log.info("  qBt instances : %s", instance_list)
+    log.info("  Torrent clients: %d qBittorrent, %d Transmission",
+             len(QBT_INSTANCES), len(TRANSMISSION_INSTANCES))
+    log.info("  Instances     : %s", instance_list)
     log.info("  Line speed    : DL %.0f Mbps / UL %.0f Mbps",
              TOTAL_BANDWIDTH_BPS / 1_000_000, TOTAL_UPLOAD_BPS / 1_000_000)
     log.info("  Poll interval : %ds (idle) / %ds (active)%s",
@@ -1141,6 +1339,7 @@ def main():
                 if _status["label"] == "UNREACHABLE":
                     log.info("Media server(s) reachable again")
                 _status["streams"] = session_count
+                _status["stream_bandwidth_bps"] = int(server_bps)
 
                 if session_count == 0:
                     # Start ramp-up if transitioning from active streams.

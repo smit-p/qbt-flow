@@ -43,6 +43,11 @@ def _make_response(body: bytes, status: int = 200, headers: Optional[dict] = Non
     return resp
 
 
+def _json_response(obj):
+    """Mock urlopen response carrying a JSON body."""
+    return _make_response(json.dumps(obj).encode())
+
+
 # ---------------------------------------------------------------------------
 # _parse_qbt_instances
 # ---------------------------------------------------------------------------
@@ -50,47 +55,47 @@ def _make_response(body: bytes, status: int = 200, headers: Optional[dict] = Non
 class TestParseQbtInstances(unittest.TestCase):
     def test_basic_http(self):
         with patch.dict(os.environ, {"QBT_INSTANCES": "myhost:9090:admin:secret"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         self.assertEqual(r, [("myhost", 9090, "admin", "secret", "http")])
 
     def test_https_scheme(self):
         with patch.dict(os.environ, {"QBT_INSTANCES": "myhost:8443:admin:secret:https"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         self.assertEqual(r[0], ("myhost", 8443, "admin", "secret", "https"))
 
     def test_multiple_instances(self):
         with patch.dict(os.environ, {"QBT_INSTANCES": "h1:8080:u:p,h2:8081:u2:p2"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         self.assertEqual(len(r), 2)
         self.assertEqual(r[0][0], "h1")
         self.assertEqual(r[1][0], "h2")
 
     def test_invalid_entry_skipped(self):
         with patch.dict(os.environ, {"QBT_INSTANCES": "badentry"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         self.assertEqual(r, [])
 
     def test_invalid_scheme_falls_back_to_http(self):
         with patch.dict(os.environ, {"QBT_INSTANCES": "h:80:u:p:ftp"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         self.assertEqual(r[0][4], "http")
 
     def test_mixed_valid_and_invalid(self):
         with patch.dict(os.environ, {"QBT_INSTANCES": "good:8080:u:p,bad"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         self.assertEqual(len(r), 1)
         self.assertEqual(r[0][0], "good")
 
     def test_password_with_colon(self):
         # password field consumes everything after 3rd colon
         with patch.dict(os.environ, {"QBT_INSTANCES": "h:8080:user:pa:ss:word"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         # parts[3] = "pa", parts[4] = "ss:word" — scheme is invalid, falls back to http
         self.assertEqual(len(r), 1)
 
     def test_trailing_comma_ignored(self):
         with patch.dict(os.environ, {"QBT_INSTANCES": "h1:8080:u:p,"}):
-            r = m._parse_qbt_instances()
+            r = m._parse_instances(os.environ.get("QBT_INSTANCES", ""), "QBT_INSTANCES")
         self.assertEqual(len(r), 1)
 
 
@@ -951,6 +956,117 @@ class TestApplyLimitsDynamic(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # get_plex_sessions
 # ---------------------------------------------------------------------------
+
+class TestTransmissionClient(unittest.TestCase):
+    def _client(self):
+        return m.TransmissionClient("host", 9091, "user", "pw")
+
+    def test_login_handshake_with_409(self):
+        import io
+        from email.message import Message
+        hdr = Message()
+        hdr["X-Transmission-Session-Id"] = "SID-XYZ"
+        err = HTTPError("u", 409, "conflict", hdr, io.BytesIO(b""))
+        ok_resp = _json_response({"result": "success", "arguments": {}})
+        with patch("qbt_flow.urlopen", side_effect=[err, ok_resp]):
+            c = self._client()
+            ok = c.login()
+        self.assertTrue(ok)
+        self.assertEqual(c.session_id, "SID-XYZ")
+
+    def test_set_speed_limits_converts_to_kb(self):
+        c = self._client()
+        c.session_id = "s"
+        with patch("qbt_flow.urlopen", return_value=_json_response({"result": "success"})) as u:
+            ok = c.set_speed_limits(50 * 1024 * 1024, 25 * 1024 * 1024)
+        self.assertTrue(ok)
+        args = json.loads(u.call_args[0][0].data.decode())["arguments"]
+        self.assertEqual(args["speed-limit-down"], 51200)   # 50 MB/s in KB/s
+        self.assertEqual(args["speed-limit-up"], 25600)
+        self.assertTrue(args["speed-limit-down-enabled"])
+        self.assertTrue(args["speed-limit-up-enabled"])
+
+    def test_set_speed_limits_zero_disables(self):
+        c = self._client()
+        c.session_id = "s"
+        with patch("qbt_flow.urlopen", return_value=_json_response({"result": "success"})) as u:
+            c.set_speed_limits(0, 0)
+        args = json.loads(u.call_args[0][0].data.decode())["arguments"]
+        self.assertFalse(args["speed-limit-down-enabled"])
+        self.assertFalse(args["speed-limit-up-enabled"])
+        self.assertNotIn("speed-limit-down", args)
+
+    def test_is_alt_limits_active(self):
+        c = self._client()
+        c.session_id = "s"
+        with patch("qbt_flow.urlopen", return_value=_json_response(
+                {"result": "success", "arguments": {"alt-speed-enabled": True}})):
+            self.assertTrue(c.is_alt_limits_active())
+        with patch("qbt_flow.urlopen", return_value=_json_response(
+                {"result": "success", "arguments": {"alt-speed-enabled": False}})):
+            self.assertFalse(c.is_alt_limits_active())
+
+    def test_get_torrent_activity_counts_by_status(self):
+        c = self._client()
+        c.session_id = "s"
+        torrents = {"result": "success", "arguments": {"torrents": [
+            {"status": 4, "rateDownload": 2_000_000, "rateUpload": 0},   # downloading
+            {"status": 6, "rateDownload": 0, "rateUpload": 500_000},     # seeding
+            {"status": 0, "rateDownload": 0, "rateUpload": 0},           # stopped
+        ]}}
+        with patch("qbt_flow.urlopen", return_value=_json_response(torrents)):
+            self.assertEqual(c.get_torrent_activity(), (1, 1))
+
+    def test_get_torrent_activity_none_on_failure(self):
+        c = self._client()
+        c.session_id = "s"
+        with patch("qbt_flow.urlopen", side_effect=URLError("down")):
+            self.assertIsNone(c.get_torrent_activity())
+
+    def test_set_speed_limits_false_on_error(self):
+        c = self._client()
+        c.session_id = "s"
+        with patch("qbt_flow.urlopen", side_effect=URLError("down")):
+            self.assertFalse(c.set_speed_limits(1024, 1024))
+
+
+class TestGetTautulliSessions(unittest.TestCase):
+    def _activity(self, sessions):
+        return _json_response({"response": {"result": "success", "data": {"sessions": sessions}}})
+
+    def test_sums_bandwidth_and_counts(self):
+        resp = self._activity([
+            {"state": "playing", "bandwidth": "12000", "location": "wan"},
+            {"state": "playing", "bandwidth": "8000", "location": "wan"},
+        ])
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_tautulli_sessions("http://taut", "key")
+        self.assertEqual(count, 2)
+        self.assertEqual(bps, 20_000_000)   # (12000+8000) kbps → bps
+
+    def test_paused_excluded(self):
+        resp = self._activity([{"state": "paused", "bandwidth": "5000", "location": "wan"}])
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_tautulli_sessions("http://taut", "key")
+        self.assertEqual((count, bps), (0, 0))
+
+    def test_lan_excluded_when_enabled(self):
+        resp = self._activity([
+            {"state": "playing", "bandwidth": "12000", "location": "wan"},
+            {"state": "playing", "bandwidth": "8000", "location": "lan"},
+        ])
+        m.IGNORE_LAN_STREAMS = True
+        self.addCleanup(setattr, m, "IGNORE_LAN_STREAMS", False)
+        with patch("qbt_flow.urlopen", return_value=resp):
+            count, bps = m.get_tautulli_sessions("http://taut", "key")
+        self.assertEqual(count, 1)
+        self.assertEqual(bps, 12_000_000)
+
+    def test_error_returns_minus_one(self):
+        with patch("qbt_flow.urlopen", side_effect=URLError("timeout")):
+            count, bps = m.get_tautulli_sessions("http://taut", "key")
+        self.assertEqual(count, -1)
+
 
 class TestClientIsLan(unittest.TestCase):
     def test_rfc1918_is_lan(self):
@@ -1929,6 +2045,17 @@ class TestStatusEndpoint(unittest.TestCase):
         m._StatusHandler.do_GET(handler)
         handler.send_response.assert_called_with(200)
         handler.send_header.assert_called_with("Content-Type", "text/plain; version=0.0.4")
+
+    def test_metrics_body_includes_new_series(self):
+        handler = MagicMock(spec=m._StatusHandler)
+        handler.path = "/metrics"
+        handler.wfile = MagicMock()
+        m._StatusHandler.do_GET(handler)
+        body = b"".join(c.args[0] for c in handler.wfile.write.call_args_list).decode()
+        for metric in ("qbt_flow_up ", "qbt_flow_build_info{", "qbt_flow_stream_bandwidth_bps ",
+                       "qbt_flow_torrent_clients ", "qbt_flow_last_webhook_timestamp_seconds ",
+                       "qbt_flow_state_info{"):
+            self.assertIn(metric, body)
 
     def test_status_handler_root(self):
         handler = MagicMock(spec=m._StatusHandler)

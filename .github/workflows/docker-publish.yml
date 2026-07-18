@@ -13,7 +13,12 @@ permissions:
   packages: write
 
 jobs:
+  # Never publish an image from a red build — run the full suite first.
+  test:
+    uses: ./.github/workflows/test.yml
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
