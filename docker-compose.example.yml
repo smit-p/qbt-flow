@@ -17,14 +17,21 @@ services:
     # your LAN and to receive webhooks; drop it and map ports if you prefer.
     network_mode: host
     environment:
-      # --- Media server(s): set at least one URL + token ---
+      # --- Media source(s): set at least one URL + token ---
       PLEX_URL: "http://192.168.1.10:32400"
       PLEX_TOKEN: "your-plex-token"
       # JELLYFIN_URL: "http://192.168.1.10:8096"
       # JELLYFIN_TOKEN: "your-jellyfin-api-key"
+      # EMBY_URL: "http://192.168.1.10:8920"
+      # EMBY_TOKEN: "your-emby-api-key"
+      # Tautulli aggregates Plex and reports real per-session bandwidth + LAN/WAN:
+      # TAUTULLI_URL: "http://192.168.1.10:8181"
+      # TAUTULLI_TOKEN: "your-tautulli-api-key"
 
-      # --- qBittorrent instance(s): host:port:user:pass[:scheme], comma-separated ---
+      # --- Torrent client(s): host:port:user:pass[:scheme], comma-separated ---
       QBT_INSTANCES: "192.168.1.10:8080:admin:adminadmin"
+      # Transmission works too (mix freely); host:9091:: if RPC auth is off:
+      # TRANSMISSION_INSTANCES: "192.168.1.10:9091:user:pass"
 
       # --- Bandwidth ---
       TOTAL_BANDWIDTH: "1Gbps"
@@ -37,6 +44,11 @@ services:
       POLL_INTERVAL_ACTIVE: "5"      # poll faster while streaming
       STATUS_PORT: "9101"            # GET /status,/metrics ; POST /webhook
       # WEBHOOK_TOKEN: "choose-a-secret"
+      # A ready-made Grafana dashboard for the /metrics endpoint lives at
+      # dashboards/grafana-qbt-flow.json in the repo.
+
+      # See config.env.example for the full set of options (racing window,
+      # dynamic split, ramp-up, logging, thresholds, …).
 
     # If NOT using host networking, expose the status/webhook port instead:
     # ports:

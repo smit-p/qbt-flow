@@ -91,7 +91,10 @@ Copy `config.env.example` to `config.env` and edit the values. All settings can 
 | `QBT_HEADROOM_FRACTION` | `1.0` | Fraction of remaining bandwidth to give qbt (download). Defaults to 1.0 (no throttling) since media streams use upload, not download |
 | `QBT_UPLOAD_FRACTION` | `0.9` | Fraction of remaining upload bandwidth to give qbt — this is the key setting for protecting streams |
 | `QBT_SPLIT_BETWEEN_INSTANCES` | `true` | Split bandwidth evenly across instances (set `false` to give each the full amount) |
-| `QBT_RESPECT_ALT_LIMITS` | `false` | When `true`, skip any instance that has qBittorrent's *alternative* speed limits toggled on, leaving the limits you set manually untouched |
+| `QBT_DYNAMIC_SPLIT` | `false` | Weight the split by each instance's active-torrent count; idle instances get only the floor. Requires split enabled and >1 instance |
+| `QBT_ACTIVE_DL_THRESHOLD` | `0` | Min download speed a torrent must exceed to count as "active" for the dynamic split (accepts `500KB`, `1MB/s`, …). `0` = only exclude stalled torrents |
+| `QBT_ACTIVE_UL_THRESHOLD` | `0` | Same as above for upload |
+| `QBT_RESPECT_ALT_LIMITS` | `false` | When `true`, skip any instance that has qBittorrent's *alternative* speed limits toggled on (Transmission turtle mode too), leaving the limits you set manually untouched |
 | `MIN_QBT_DL` | `10MB/s` | Minimum download limit — qbt is never throttled below this |
 | `MIN_QBT_UL` | `5MB/s` | Minimum upload limit |
 | `STREAM_OVERHEAD_FACTOR` | `1.25` | Multiplier on stream bitrates to account for buffering |
